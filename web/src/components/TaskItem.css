@@ -43,9 +43,24 @@
 /* Main row */
 .task-item-main {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 12px;
   padding: 14px 16px;
+}
+
+.task-item-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Desktop actions - align to right and vertically centered */
+.desktop-actions {
+  margin-left: auto;
+  flex-shrink: 0;
+  align-self: center;
 }
 
 .task-item:hover .task-item-main {
