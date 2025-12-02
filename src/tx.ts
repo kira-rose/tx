@@ -1,325 +1,72 @@
 #!/usr/bin/env node
 
+// ============================================================================
+// TX - SEMANTIC TASK MANAGEMENT CLI
+// ============================================================================
+// Refactored to use the new storage interface and config system.
+
 import { ChatBedrockConverse } from "@langchain/aws";
 import { ChatOpenAI } from "@langchain/openai";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-import { homedir } from "os";
-import {
-  readFileSync,
-  existsSync,
-  mkdirSync,
-  writeFileSync,
-  readdirSync,
-  unlinkSync,
-} from "fs";
-import { join } from "path";
-import { randomUUID } from "crypto";
 import { createInterface } from "readline";
+import { randomUUID } from "crypto";
+
+// Import server
+import { startServerCLI } from "./server/index.js";
+
+// Import types
+import {
+  Task,
+  TaskIndex,
+  TaskSchema,
+  TaskStatus,
+  Scope,
+  SemanticField,
+  FieldDefinition,
+  LLMConfig,
+  TxConfig,
+  DEFAULT_SCHEMA,
+} from "./types/index.js";
+
+// Import storage and config
+import { IStorage, createStorage, getStorageTypeName } from "./storage/index.js";
+import { loadConfig, saveConfig, getDataDir, describeConfig, getCurrentScope, setCurrentScope } from "./config/index.js";
 
 // ============================================================================
-// TYPES
+// GLOBAL STATE
 // ============================================================================
 
-interface BedrockConfig {
-  model?: string;
-  region?: string;
-}
-
-interface OpenAIConfig {
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-}
-
-interface LocalConfig {
-  baseUrl: string;
-  model: string;
-  apiKey?: string;
-}
-
-interface Config {
-  provider: "bedrock" | "openai" | "local";
-  bedrock?: BedrockConfig;
-  openai?: OpenAIConfig;
-  local?: LocalConfig;
-}
-
-interface SemanticField {
-  name: string;
-  value: string | string[] | number | boolean | null;
-  confidence?: number;
-  normalized?: string; // Canonical form
-}
-
-interface CompletionInfo {
-  completedAt: string;
-  duration?: number; // minutes
-  notes?: string;
-  actualEffort?: string;
-}
-
-interface Task {
-  id: string;
-  raw: string;
-  created: string;
-  updated: string;
-  completed: boolean;
-  completionInfo?: CompletionInfo;
-  fields: Record<string, SemanticField>;
-  // Relationships
-  blocks?: string[]; // Task IDs this blocks
-  blockedBy?: string[]; // Task IDs blocking this
-  parent?: string; // Parent task ID
-  subtasks?: string[]; // Subtask IDs
-  // Recurrence
-  recurrence?: {
-    pattern: string; // daily, weekly, monthly, yearly
-    interval?: number; // every N days/weeks/etc
-    dayOfWeek?: string; // monday, tuesday, etc
-    dayOfMonth?: number; // 1-31
-    nextDue?: string; // ISO date
-  };
-  // Template
-  templateId?: string; // If created from a template
-}
-
-interface TaskIndex {
-  tasks: string[];
-  structures: Record<string, StructureInfo>;
-  aliases: Record<string, string[]>; // canonical -> [variants]
-  templates: Record<string, TaskTemplate>;
-  stats: TaskStats;
-}
-
-interface StructureInfo {
-  name: string;
-  occurrences: number;
-  examples: string[];
-  type: "string" | "date" | "datetime" | "number" | "boolean" | "array" | "duration" | "unknown";
-}
-
-interface TaskTemplate {
-  id: string;
-  name: string;
-  pattern: string; // regex or description
-  defaultFields: Record<string, SemanticField>;
-  occurrences: number;
-}
-
-interface TaskStats {
-  totalCreated: number;
-  totalCompleted: number;
-  averageDuration: Record<string, number>; // task_type -> avg minutes
-  completionsByDay: Record<string, number>; // ISO date -> count
-  completionsByProject: Record<string, number>;
-}
-
-// JSON Schema for semantic fields
-interface FieldDefinition {
-  type: "string" | "date" | "datetime" | "number" | "boolean" | "array" | "duration";
-  description: string;
-  examples?: string[];
-  aliases?: string[]; // Alternative names that map to this field
-  enum?: string[]; // Allowed values for string types
-  category?: "core" | "relationship" | "recurrence" | "custom";
-}
-
-interface TaskSchema {
-  $schema: string;
-  $id: string;
-  title: string;
-  description: string;
-  version: number;
-  lastUpdated: string;
-  fields: Record<string, FieldDefinition>;
-}
-
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
-const CONFIG_DIR = join(homedir(), ".cx");
-const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const TASKS_DIR = join(CONFIG_DIR, "tasks");
-const INDEX_PATH = join(TASKS_DIR, "index.json");
-const SCHEMA_PATH = join(TASKS_DIR, "schema.json");
-const ARCHIVE_DIR = join(TASKS_DIR, "archive");
-
-const DEFAULT_SCHEMA: TaskSchema = {
-  $schema: "http://json-schema.org/draft-07/schema#",
-  $id: "tx-task-schema",
-  title: "Task Semantic Schema",
-  description: "Defines the semantic fields that can be extracted from task descriptions",
-  version: 1,
-  lastUpdated: new Date().toISOString(),
-  fields: {
-    // Core fields
-    action: {
-      type: "string",
-      description: "The core verb/action to be performed",
-      examples: ["update", "fix", "call", "review", "deploy", "write"],
-      category: "core",
-    },
-    summary: {
-      type: "string",
-      description: "A brief one-line summary of the task",
-      category: "core",
-    },
-    subject: {
-      type: "string",
-      description: "The project, system, or area this task relates to",
-      aliases: ["project"],
-      examples: ["webapp", "backend", "documentation"],
-      category: "core",
-    },
-    deadline: {
-      type: "datetime",
-      description: "When the task is due. Use YYYY-MM-DD for date-only, or YYYY-MM-DDTHH:MM for date+time",
-      examples: ["2025-12-03", "2025-12-03T14:00", "2025-01-15T09:30"],
-      category: "core",
-    },
-    priority: {
-      type: "string",
-      description: "Task urgency level",
-      enum: ["urgent", "high", "normal", "low"],
-      category: "core",
-    },
-    people: {
-      type: "array",
-      description: "People mentioned or involved in the task",
-      examples: ["john_smith", "sarah"],
-      category: "core",
-    },
-    context: {
-      type: "string",
-      description: "GTD-style context indicating where/how the task can be done",
-      enum: ["@computer", "@phone", "@errands", "@home", "@work", "@anywhere"],
-      category: "core",
-    },
-    tags: {
-      type: "array",
-      description: "Categories or labels for the task",
-      category: "core",
-    },
-    effort: {
-      type: "duration",
-      description: "Estimated time/effort required",
-      enum: ["quick", "30min", "1hour", "2hours", "half-day", "full-day", "multi-day"],
-      category: "core",
-    },
-    energy: {
-      type: "string",
-      description: "Mental energy level required",
-      enum: ["high", "medium", "low"],
-      aliases: ["focus"],
-      category: "core",
-    },
-    task_type: {
-      type: "string",
-      description: "Category of task",
-      examples: ["bug_fix", "feature", "meeting", "communication", "review", "deployment", "research"],
-      category: "core",
-    },
-    // Relationship fields
-    blocks: {
-      type: "array",
-      description: "Task IDs that this task blocks",
-      category: "relationship",
-    },
-    related_to: {
-      type: "array",
-      description: "Related projects, tasks, or concepts",
-      category: "relationship",
-    },
-    depends_on: {
-      type: "array",
-      description: "Prerequisites or dependencies",
-      category: "relationship",
-    },
-    // Recurrence fields
-    recurrence_pattern: {
-      type: "string",
-      description: "How often the task repeats",
-      enum: ["daily", "weekly", "monthly", "yearly"],
-      category: "recurrence",
-    },
-    recurrence_day: {
-      type: "string",
-      description: "Specific day for recurrence",
-      examples: ["monday", "1st", "15th", "last"],
-      category: "recurrence",
-    },
-  },
-};
-
-const DEFAULT_CONFIG: Config = {
-  provider: "bedrock",
-  bedrock: {
-    model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
-    region: "us-east-1",
-  },
-  openai: {
-    baseUrl: "https://openrouter.ai/api/v1",
-    apiKey: "your-api-key-here",
-    model: "anthropic/claude-3.5-sonnet",
-  },
-  local: {
-    baseUrl: "http://localhost:11434/v1",
-    model: "llama3.2",
-  },
-};
+let storage: IStorage;
+let config: TxConfig;
 
 // ============================================================================
 // UTILITIES
 // ============================================================================
 
-function ensureDirectories() {
-  for (const dir of [CONFIG_DIR, TASKS_DIR, ARCHIVE_DIR]) {
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-  }
-}
-
-function loadConfig(): Config {
-  ensureDirectories();
-  if (!existsSync(CONFIG_PATH)) {
-    writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
-    console.log(`\x1b[33mCreated default config at ${CONFIG_PATH}\x1b[0m`);
-    return DEFAULT_CONFIG;
-  }
-  try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Config;
-  } catch {
-    console.error(`\x1b[31mError reading config\x1b[0m`);
-    process.exit(1);
-  }
-}
-
-function createModel(config: Config): BaseChatModel {
-  switch (config.provider) {
+function createModel(llmConfig: LLMConfig): BaseChatModel {
+  switch (llmConfig.provider) {
     case "bedrock":
       return new ChatBedrockConverse({
-        model: config.bedrock?.model || "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        region: config.bedrock?.region || "us-east-1",
+        model: llmConfig.bedrock?.model || "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        region: llmConfig.bedrock?.region || "us-east-1",
       });
     case "openai":
-      if (!config.openai) throw new Error("OpenAI config not found");
+      if (!llmConfig.openai) throw new Error("OpenAI config not found");
       return new ChatOpenAI({
-        modelName: config.openai.model,
-        openAIApiKey: config.openai.apiKey,
-        configuration: { baseURL: config.openai.baseUrl },
+        modelName: llmConfig.openai.model,
+        openAIApiKey: llmConfig.openai.apiKey,
+        configuration: { baseURL: llmConfig.openai.baseUrl },
       });
     case "local":
-      if (!config.local) throw new Error("Local config not found");
+      if (!llmConfig.local) throw new Error("Local config not found");
       return new ChatOpenAI({
-        modelName: config.local.model,
-        openAIApiKey: config.local.apiKey || "not-needed",
-        configuration: { baseURL: config.local.baseUrl },
+        modelName: llmConfig.local.model,
+        openAIApiKey: llmConfig.local.apiKey || "not-needed",
+        configuration: { baseURL: llmConfig.local.baseUrl },
       });
     default:
-      throw new Error(`Unknown provider: ${config.provider}`);
+      throw new Error(`Unknown provider: ${llmConfig.provider}`);
   }
 }
 
@@ -374,7 +121,6 @@ function parseRelativeDate(text: string): string | null {
     return d.toISOString().split("T")[0];
   }
 
-  // Check for "next week", "in N days", etc.
   const inDaysMatch = lower.match(/in (\d+) days?/);
   if (inDaysMatch) {
     const d = new Date(today);
@@ -395,7 +141,6 @@ function parseRelativeDate(text: string): string | null {
 function parseTime(timeStr: string): { hours: number; minutes: number } | null {
   const lower = timeStr.toLowerCase().trim();
   
-  // Match patterns like "2pm", "2:30pm", "14:00", "2:30 pm"
   const match12h = lower.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/);
   if (match12h) {
     let hours = parseInt(match12h[1]);
@@ -408,7 +153,6 @@ function parseTime(timeStr: string): { hours: number; minutes: number } | null {
     return { hours, minutes };
   }
   
-  // Match 24-hour format like "14:00", "09:30"
   const match24h = lower.match(/^(\d{1,2}):(\d{2})$/);
   if (match24h) {
     return { hours: parseInt(match24h[1]), minutes: parseInt(match24h[2]) };
@@ -418,12 +162,10 @@ function parseTime(timeStr: string): { hours: number; minutes: number } | null {
 }
 
 function normalizeDeadline(value: string): string {
-  // Already valid ISO date (YYYY-MM-DD)
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     return value;
   }
   
-  // Already valid ISO datetime (YYYY-MM-DDTHH:MM)
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) {
     return value;
   }
@@ -436,8 +178,6 @@ function normalizeDeadline(value: string): string {
     return d.toISOString().split("T")[0];
   })();
   
-  // Patterns like "2pm today", "today at 2pm", "today 2pm"
-  const todayTimeMatch = lower.match(/(?:today\s*(?:at\s*)?|(?:at\s*)?(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*today)/);
   if (lower.includes("today")) {
     const timeMatch = lower.match(/(\d{1,2}(?::\d{2})?\s*(?:am|pm))/);
     if (timeMatch) {
@@ -451,7 +191,6 @@ function normalizeDeadline(value: string): string {
     return today;
   }
   
-  // Patterns like "2pm tomorrow", "tomorrow at 2pm"
   if (lower.includes("tomorrow")) {
     const timeMatch = lower.match(/(\d{1,2}(?::\d{2})?\s*(?:am|pm))/);
     if (timeMatch) {
@@ -465,7 +204,6 @@ function normalizeDeadline(value: string): string {
     return tomorrow;
   }
   
-  // Just a time like "2pm", "14:00" - assume today
   const timeOnly = parseTime(value);
   if (timeOnly) {
     const hours = timeOnly.hours.toString().padStart(2, "0");
@@ -473,13 +211,11 @@ function normalizeDeadline(value: string): string {
     return `${today}T${hours}:${mins}`;
   }
   
-  // Try parseRelativeDate for things like "tuesday", "next week"
   const relDate = parseRelativeDate(value);
   if (relDate) {
     return relDate;
   }
   
-  // Return as-is if we can't parse it (will show as invalid)
   return value;
 }
 
@@ -497,7 +233,6 @@ function getWeekRange(): { start: string; end: string } {
 }
 
 function getDatePart(datetime: string): string {
-  // Extract YYYY-MM-DD from either "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM"
   return datetime.split("T")[0];
 }
 
@@ -505,7 +240,6 @@ function isOverdue(deadline: string): boolean {
   const deadlineDate = getDatePart(deadline);
   const today = getToday();
   
-  // If deadline is today but has a time component, check if that time has passed
   if (deadlineDate === today && deadline.includes("T")) {
     return new Date(deadline) < new Date();
   }
@@ -524,105 +258,26 @@ function isThisWeek(deadline: string): boolean {
 }
 
 // ============================================================================
-// INDEX & TASK STORAGE
+// SCHEMA OPERATIONS
 // ============================================================================
-
-function loadIndex(): TaskIndex {
-  ensureDirectories();
-
-  const defaultIndex: TaskIndex = {
-    tasks: [],
-    structures: {},
-    aliases: {},
-    templates: {},
-    stats: {
-      totalCreated: 0,
-      totalCompleted: 0,
-      averageDuration: {},
-      completionsByDay: {},
-      completionsByProject: {},
-    },
-  };
-
-  if (!existsSync(INDEX_PATH)) {
-    return defaultIndex;
-  }
-
-  try {
-    const loaded = JSON.parse(readFileSync(INDEX_PATH, "utf-8"));
-    // Merge with defaults to handle migration from older versions
-    return {
-      tasks: loaded.tasks || [],
-      structures: loaded.structures || {},
-      aliases: loaded.aliases || {},
-      templates: loaded.templates || {},
-      stats: {
-        totalCreated: loaded.stats?.totalCreated || loaded.tasks?.length || 0,
-        totalCompleted: loaded.stats?.totalCompleted || 0,
-        averageDuration: loaded.stats?.averageDuration || {},
-        completionsByDay: loaded.stats?.completionsByDay || {},
-        completionsByProject: loaded.stats?.completionsByProject || {},
-      },
-    };
-  } catch {
-    return defaultIndex;
-  }
-}
-
-function saveIndex(index: TaskIndex) {
-  ensureDirectories();
-  writeFileSync(INDEX_PATH, JSON.stringify(index, null, 2));
-}
-
-function loadSchema(): TaskSchema {
-  ensureDirectories();
-  if (!existsSync(SCHEMA_PATH)) {
-    // Create default schema
-    const schema = { ...DEFAULT_SCHEMA, lastUpdated: new Date().toISOString() };
-    writeFileSync(SCHEMA_PATH, JSON.stringify(schema, null, 2));
-    return schema;
-  }
-  try {
-    const loaded = JSON.parse(readFileSync(SCHEMA_PATH, "utf-8")) as TaskSchema;
-    // Merge with defaults to ensure all core fields exist
-    for (const [key, def] of Object.entries(DEFAULT_SCHEMA.fields)) {
-      if (!loaded.fields[key]) {
-        loaded.fields[key] = def;
-      }
-    }
-    return loaded;
-  } catch {
-    return { ...DEFAULT_SCHEMA, lastUpdated: new Date().toISOString() };
-  }
-}
-
-function saveSchema(schema: TaskSchema) {
-  ensureDirectories();
-  schema.lastUpdated = new Date().toISOString();
-  writeFileSync(SCHEMA_PATH, JSON.stringify(schema, null, 2));
-}
 
 function addFieldToSchema(
   schema: TaskSchema,
   fieldName: string,
   definition: Partial<FieldDefinition>
 ): boolean {
-  // Normalize field name
   const normalizedName = fieldName.toLowerCase().replace(/\s+/g, "_");
 
-  // Check if field already exists or is an alias
   if (schema.fields[normalizedName]) {
-    return false; // Already exists
+    return false;
   }
 
-  // Check if it's an alias of an existing field
-  for (const [existingName, existingDef] of Object.entries(schema.fields)) {
+  for (const [, existingDef] of Object.entries(schema.fields)) {
     if (existingDef.aliases?.includes(normalizedName)) {
-      return false; // Is an alias
+      return false;
     }
   }
 
-  // Add new field
   schema.fields[normalizedName] = {
     type: definition.type || "string",
     description: definition.description || `Auto-discovered field: ${normalizedName}`,
@@ -637,80 +292,90 @@ function addFieldToSchema(
 function resolveFieldName(schema: TaskSchema, fieldName: string): string {
   const normalized = fieldName.toLowerCase().replace(/\s+/g, "_");
 
-  // Direct match
   if (schema.fields[normalized]) {
     return normalized;
   }
 
-  // Check aliases
   for (const [canonicalName, def] of Object.entries(schema.fields)) {
     if (def.aliases?.includes(normalized)) {
       return canonicalName;
     }
   }
 
-  // No match - return as-is (will be added as new field)
   return normalized;
 }
 
-function loadTask(id: string): Task | null {
-  const taskPath = join(TASKS_DIR, `${id}.json`);
-  if (!existsSync(taskPath)) {
-    // Check archive
-    const archivePath = join(ARCHIVE_DIR, `${id}.json`);
-    if (existsSync(archivePath)) {
-      return JSON.parse(readFileSync(archivePath, "utf-8")) as Task;
+// ============================================================================
+// STRUCTURE & ALIAS MANAGEMENT
+// ============================================================================
+
+function updateStructures(index: TaskIndex, fields: Record<string, SemanticField> | null | undefined) {
+  if (!fields) return;
+  for (const [key, field] of Object.entries(fields)) {
+    if (!index.structures[key]) {
+      index.structures[key] = {
+        name: key,
+        occurrences: 0,
+        examples: [],
+        type: "unknown",
+      };
     }
-    return null;
-  }
-  try {
-    return JSON.parse(readFileSync(taskPath, "utf-8")) as Task;
-  } catch {
-    return null;
-  }
-}
 
-function saveTask(task: Task) {
-  ensureDirectories();
-  writeFileSync(join(TASKS_DIR, `${task.id}.json`), JSON.stringify(task, null, 2));
-}
+    const struct = index.structures[key];
+    struct.occurrences++;
 
-function archiveTask(task: Task) {
-  ensureDirectories();
-  writeFileSync(join(ARCHIVE_DIR, `${task.id}.json`), JSON.stringify(task, null, 2));
-  // Remove from active
-  const activePath = join(TASKS_DIR, `${task.id}.json`);
-  if (existsSync(activePath)) {
-    unlinkSync(activePath);
-  }
-}
+    const value = field.value;
+    if (typeof value === "string") {
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)) {
+        struct.type = "datetime";
+      } else if (/^\d{4}-\d{2}-\d{2}/.test(value) || /today|tomorrow|monday|tuesday|wednesday|thursday|friday/i.test(value)) {
+        struct.type = "date";
+      } else if (/^\d+\s*(min|hour|day|h|m)/.test(value)) {
+        struct.type = "duration";
+      } else {
+        struct.type = "string";
+      }
+    } else if (typeof value === "number") {
+      struct.type = "number";
+    } else if (typeof value === "boolean") {
+      struct.type = "boolean";
+    } else if (Array.isArray(value)) {
+      struct.type = "array";
+    }
 
-function deleteTaskFile(taskId: string) {
-  const taskPath = join(TASKS_DIR, `${taskId}.json`);
-  if (existsSync(taskPath)) {
-    unlinkSync(taskPath);
-  }
-}
+    const valueStr = JSON.stringify(field.value);
+    if (!struct.examples.includes(valueStr) && struct.examples.length < 5) {
+      struct.examples.push(valueStr);
+    }
 
-function loadAllTasks(includeCompleted = false): Task[] {
-  const index = loadIndex();
-  const tasks: Task[] = [];
-  for (const id of index.tasks) {
-    const task = loadTask(id);
-    if (task && (includeCompleted || !task.completed)) {
-      tasks.push(task);
+    if (field.normalized && field.normalized !== field.value) {
+      const canonical = field.normalized as string;
+      const variant = String(field.value);
+      if (!index.aliases[canonical]) {
+        index.aliases[canonical] = [];
+      }
+      if (!index.aliases[canonical].includes(variant)) {
+        index.aliases[canonical].push(variant);
+      }
     }
   }
-  return tasks;
 }
 
-function findTaskByPrefix(prefix: string): Task | null {
-  const index = loadIndex();
-  const matches = index.tasks.filter((id) => id.startsWith(prefix));
-  if (matches.length === 1) {
-    return loadTask(matches[0]);
+function updateTemplates(index: TaskIndex, task: Task, templateId?: string) {
+  if (!templateId) return;
+  if (!task.fields) return;
+
+  if (!index.templates[templateId]) {
+    index.templates[templateId] = {
+      id: templateId,
+      name: templateId,
+      pattern: task.raw,
+      defaultFields: { ...task.fields },
+      occurrences: 0,
+    };
   }
-  return null;
+
+  index.templates[templateId].occurrences++;
 }
 
 // ============================================================================
@@ -843,7 +508,7 @@ interface ExtractedTask {
   recurrence?: Task["recurrence"];
   templateId?: string;
   seq?: number;
-  dependsOn?: number; // Index of task this depends on
+  dependsOn?: number;
 }
 
 interface ExtractionResult {
@@ -853,11 +518,10 @@ interface ExtractionResult {
 
 async function extractSemantics(
   raw: string,
-  config: Config,
   schema: TaskSchema,
   index: TaskIndex
 ): Promise<ExtractionResult> {
-  const model = createModel(config);
+  const model = createModel(config.llm);
 
   const response = await model.invoke([
     new SystemMessage(getExtractionPrompt(schema, index)),
@@ -878,7 +542,6 @@ async function extractSemantics(
   try {
     const parsed = JSON.parse(jsonMatch[0]);
 
-    // Helper to normalize field values (especially deadlines)
     function normalizeFieldValue(fieldName: string, field: SemanticField): SemanticField {
       if (fieldName === "deadline" && typeof field.value === "string") {
         return { ...field, value: normalizeDeadline(field.value as string) };
@@ -886,37 +549,37 @@ async function extractSemantics(
       return field;
     }
 
-    // Handle new multi-task format
     if (parsed.tasks && Array.isArray(parsed.tasks)) {
-      const tasks: ExtractedTask[] = parsed.tasks.map((t: any, idx: number) => {
+      const tasks: ExtractedTask[] = parsed.tasks.map((t: Record<string, unknown>, idx: number) => {
         const normalizedFields: Record<string, SemanticField> = {};
-        for (const [key, value] of Object.entries(t.fields || {})) {
+        const fields = t.fields as Record<string, SemanticField> | undefined;
+        for (const [key, value] of Object.entries(fields || {})) {
           const canonicalName = resolveFieldName(schema, key);
           normalizedFields[canonicalName] = normalizeFieldValue(canonicalName, value as SemanticField);
         }
 
         return {
-          raw: t.raw || raw,
+          raw: (t.raw as string) || raw,
           fields: Object.keys(normalizedFields).length > 0
             ? normalizedFields
-            : { action: { name: "action", value: t.raw || raw } },
-          summary: t.summary || t.raw || raw,
-          recurrence: t.recurrence,
-          templateId: t.suggestedTemplate,
-          seq: t.seq ?? idx,
-          dependsOn: t.dependsOn,
+            : { action: { name: "action", value: (t.raw as string) || raw } },
+          summary: (t.summary as string) || (t.raw as string) || raw,
+          recurrence: t.recurrence as Task["recurrence"],
+          templateId: t.suggestedTemplate as string | undefined,
+          seq: (t.seq as number) ?? idx,
+          dependsOn: t.dependsOn as number | undefined,
         };
       });
 
       return {
         tasks,
-        newFields: parsed.newFields,
+        newFields: parsed.newFields as NewFieldProposal[],
       };
     }
 
-    // Fallback: handle old single-task format for backwards compatibility
     const normalizedFields: Record<string, SemanticField> = {};
-    for (const [key, value] of Object.entries(parsed.fields || {})) {
+    const fields = parsed.fields as Record<string, SemanticField> | undefined;
+    for (const [key, value] of Object.entries(fields || {})) {
       const canonicalName = resolveFieldName(schema, key);
       normalizedFields[canonicalName] = normalizeFieldValue(canonicalName, value as SemanticField);
     }
@@ -927,11 +590,11 @@ async function extractSemantics(
         fields: Object.keys(normalizedFields).length > 0
           ? normalizedFields
           : { action: { name: "action", value: raw } },
-        summary: parsed.summary || raw,
-        recurrence: parsed.recurrence,
-        templateId: parsed.suggestedTemplate,
+        summary: (parsed.summary as string) || raw,
+        recurrence: parsed.recurrence as Task["recurrence"],
+        templateId: parsed.suggestedTemplate as string | undefined,
       }],
-      newFields: parsed.newFields,
+      newFields: parsed.newFields as NewFieldProposal[],
     };
   } catch {
     return { 
@@ -946,10 +609,9 @@ async function extractSemantics(
 
 async function naturalLanguageQuery(
   query: string,
-  config: Config,
   index: TaskIndex
 ): Promise<{ filters: Array<{ field: string; op: string; value: string }>; groupBy?: string; sort?: string }> {
-  const model = createModel(config);
+  const model = createModel(config.llm);
 
   const structureList = Object.entries(index.structures)
     .map(([k, v]) => `${k} (${v.type}): ${v.examples.slice(0, 3).join(", ")}`)
@@ -1003,92 +665,17 @@ Examples:
 }
 
 // ============================================================================
-// STRUCTURE & ALIAS MANAGEMENT
-// ============================================================================
-
-function updateStructures(index: TaskIndex, fields: Record<string, SemanticField> | null | undefined) {
-  if (!fields) return;
-  for (const [key, field] of Object.entries(fields)) {
-    if (!index.structures[key]) {
-      index.structures[key] = {
-        name: key,
-        occurrences: 0,
-        examples: [],
-        type: "unknown",
-      };
-    }
-
-    const struct = index.structures[key];
-    struct.occurrences++;
-
-    const value = field.value;
-    if (typeof value === "string") {
-      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value)) {
-        struct.type = "datetime";
-      } else if (/^\d{4}-\d{2}-\d{2}/.test(value) || /today|tomorrow|monday|tuesday|wednesday|thursday|friday/i.test(value)) {
-        struct.type = "date";
-      } else if (/^\d+\s*(min|hour|day|h|m)/.test(value)) {
-        struct.type = "duration";
-      } else {
-        struct.type = "string";
-      }
-    } else if (typeof value === "number") {
-      struct.type = "number";
-    } else if (typeof value === "boolean") {
-      struct.type = "boolean";
-    } else if (Array.isArray(value)) {
-      struct.type = "array";
-    }
-
-    const valueStr = JSON.stringify(field.value);
-    if (!struct.examples.includes(valueStr) && struct.examples.length < 5) {
-      struct.examples.push(valueStr);
-    }
-
-    // Track aliases
-    if (field.normalized && field.normalized !== field.value) {
-      const canonical = field.normalized as string;
-      const variant = String(field.value);
-      if (!index.aliases[canonical]) {
-        index.aliases[canonical] = [];
-      }
-      if (!index.aliases[canonical].includes(variant)) {
-        index.aliases[canonical].push(variant);
-      }
-    }
-  }
-}
-
-function updateTemplates(index: TaskIndex, task: Task, templateId?: string) {
-  if (!templateId) return;
-  if (!task.fields) return;
-
-  if (!index.templates[templateId]) {
-    index.templates[templateId] = {
-      id: templateId,
-      name: templateId,
-      pattern: task.raw,
-      defaultFields: { ...task.fields },
-      occurrences: 0,
-    };
-  }
-
-  index.templates[templateId].occurrences++;
-}
-
-// ============================================================================
 // TASK OPERATIONS
 // ============================================================================
 
-async function addTasks(raw: string, config: Config, options: { blocks?: string } = {}): Promise<{ tasks: Task[]; schemaUpdated: boolean }> {
-  const index = loadIndex();
-  const schema = loadSchema();
+async function addTasks(raw: string, options: { blocks?: string } = {}): Promise<{ tasks: Task[]; schemaUpdated: boolean }> {
+  const index = await storage.loadIndex();
+  const schema = await storage.loadSchema();
 
   console.log(`\x1b[90m⏳ Extracting semantic structure...\x1b[0m`);
 
-  const { tasks: extractedTasks, newFields } = await extractSemantics(raw, config, schema, index);
+  const { tasks: extractedTasks, newFields } = await extractSemantics(raw, schema, index);
 
-  // Handle new field proposals - add to schema
   let schemaUpdated = false;
   if (newFields && newFields.length > 0) {
     for (const proposal of newFields) {
@@ -1102,36 +689,53 @@ async function addTasks(raw: string, config: Config, options: { blocks?: string 
       }
     }
     if (schemaUpdated) {
-      saveSchema(schema);
+      await storage.saveSchema(schema);
     }
   }
 
   const createdTasks: Task[] = [];
 
-  // First pass: create all tasks
   for (const extracted of extractedTasks) {
-    // Add summary to fields
     extracted.fields.summary = { name: "summary", value: extracted.summary };
+
+    // Auto-assign current scope if set and not already specified
+    const currentScope = getCurrentScope(config);
+    if (currentScope && !extracted.fields.scope) {
+      extracted.fields.scope = { name: "scope", value: currentScope };
+    }
+
+    // Auto-assign subject to scope if we have both
+    if (currentScope && extracted.fields.subject) {
+      const subject = String(extracted.fields.subject.value).toLowerCase().replace(/\s+/g, "_");
+      if (!index.subjectScopes[subject]) {
+        index.subjectScopes[subject] = currentScope;
+        if (index.scopes[currentScope]) {
+          if (!index.scopes[currentScope].subjects.includes(subject)) {
+            index.scopes[currentScope].subjects.push(subject);
+          }
+        }
+      }
+    }
 
     const task: Task = {
       id: randomUUID(),
       raw: extracted.raw,
       created: new Date().toISOString(),
       updated: new Date().toISOString(),
+      status: "backlog", // New tasks start in backlog
       completed: false,
       fields: extracted.fields,
       recurrence: extracted.recurrence,
       templateId: extracted.templateId,
     };
 
-    // Handle blocking relationship from --blocks flag (only for first task if multiple)
     if (options.blocks && createdTasks.length === 0) {
-      const blockedTask = findTaskByPrefix(options.blocks);
+      const blockedTask = await storage.findTaskByPrefix(options.blocks);
       if (blockedTask) {
         task.blocks = [blockedTask.id];
         blockedTask.blockedBy = blockedTask.blockedBy || [];
         blockedTask.blockedBy.push(task.id);
-        saveTask(blockedTask);
+        await storage.saveTask(blockedTask);
       }
     }
 
@@ -1140,24 +744,24 @@ async function addTasks(raw: string, config: Config, options: { blocks?: string 
 
     index.tasks.push(task.id);
     index.stats.totalCreated++;
+    if (index.stats.byStatus) {
+      index.stats.byStatus.backlog++;
+    }
 
     createdTasks.push(task);
   }
 
-  // Second pass: set up dependencies between tasks based on "dependsOn"
   for (let i = 0; i < extractedTasks.length; i++) {
     const extracted = extractedTasks[i];
     if (extracted.dependsOn !== undefined && extracted.dependsOn >= 0 && extracted.dependsOn < createdTasks.length) {
       const dependentTask = createdTasks[i];
       const prerequisiteTask = createdTasks[extracted.dependsOn];
 
-      // prerequisiteTask blocks dependentTask
       prerequisiteTask.blocks = prerequisiteTask.blocks || [];
       if (!prerequisiteTask.blocks.includes(dependentTask.id)) {
         prerequisiteTask.blocks.push(dependentTask.id);
       }
 
-      // dependentTask is blocked by prerequisiteTask
       dependentTask.blockedBy = dependentTask.blockedBy || [];
       if (!dependentTask.blockedBy.includes(prerequisiteTask.id)) {
         dependentTask.blockedBy.push(prerequisiteTask.id);
@@ -1165,58 +769,50 @@ async function addTasks(raw: string, config: Config, options: { blocks?: string 
     }
   }
 
-  // Save all tasks
   for (const task of createdTasks) {
-    saveTask(task);
+    await storage.saveTask(task);
   }
 
-  saveIndex(index);
+  await storage.saveIndex(index);
 
   return { tasks: createdTasks, schemaUpdated };
 }
 
-function deleteTask(taskId: string): Task | null {
-  const task = findTaskByPrefix(taskId);
+async function deleteTask(taskId: string): Promise<Task | null> {
+  const task = await storage.findTaskByPrefix(taskId);
   if (!task) return null;
 
-  const index = loadIndex();
-
-  // Remove from index
+  const index = await storage.loadIndex();
   index.tasks = index.tasks.filter((id) => id !== task.id);
 
-  // Update any tasks that were blocked by this one
   for (const id of index.tasks) {
-    const t = loadTask(id);
+    const t = await storage.loadTask(id);
     if (t && t.blockedBy?.includes(task.id)) {
       t.blockedBy = t.blockedBy.filter((bid) => bid !== task.id);
-      saveTask(t);
+      await storage.saveTask(t);
     }
   }
 
-  // Update any tasks this was blocking
   if (task.blocks) {
     for (const blockedId of task.blocks) {
-      const blocked = loadTask(blockedId);
+      const blocked = await storage.loadTask(blockedId);
       if (blocked && blocked.blockedBy) {
         blocked.blockedBy = blocked.blockedBy.filter((bid) => bid !== task.id);
-        saveTask(blocked);
+        await storage.saveTask(blocked);
       }
     }
   }
 
-  // Delete the task file
-  deleteTaskFile(task.id);
-
-  saveIndex(index);
+  await storage.deleteTask(task.id);
+  await storage.saveIndex(index);
 
   return task;
 }
 
-async function completeTask(taskId: string, config: Config): Promise<Task | null> {
-  const task = findTaskByPrefix(taskId);
+async function completeTask(taskId: string): Promise<Task | null> {
+  const task = await storage.findTaskByPrefix(taskId);
   if (!task) return null;
 
-  // Ask for completion details
   const durationStr = await prompt(`\x1b[33mHow long did this take? (e.g., 30min, 2h, skip):\x1b[0m `);
   const notes = await prompt(`\x1b[33mAny notes? (or skip):\x1b[0m `);
 
@@ -1231,6 +827,8 @@ async function completeTask(taskId: string, config: Config): Promise<Task | null
     }
   }
 
+  const oldStatus = task.status;
+  task.status = "completed";
   task.completed = true;
   task.updated = new Date().toISOString();
   task.completionInfo = {
@@ -1239,8 +837,14 @@ async function completeTask(taskId: string, config: Config): Promise<Task | null
     notes: notes !== "skip" ? notes : undefined,
   };
 
-  // Update stats
-  const index = loadIndex();
+  // Update status counts
+  const index = await storage.loadIndex();
+  if (index.stats.byStatus) {
+    if (oldStatus && index.stats.byStatus[oldStatus] > 0) {
+      index.stats.byStatus[oldStatus]--;
+    }
+    index.stats.byStatus.completed++;
+  }
   index.stats.totalCompleted++;
 
   const today = getToday();
@@ -1249,24 +853,24 @@ async function completeTask(taskId: string, config: Config): Promise<Task | null
   const project = String(task.fields.project?.value || task.fields.subject?.value || "unknown");
   index.stats.completionsByProject[project] = (index.stats.completionsByProject[project] || 0) + 1;
 
-  // Update average duration for task type
   if (duration && task.fields.task_type) {
     const taskType = String(task.fields.task_type.value);
     const current = index.stats.averageDuration[taskType] || duration;
     index.stats.averageDuration[taskType] = Math.round((current + duration) / 2);
   }
 
-  // Handle recurrence
   if (task.recurrence) {
-    // Create next occurrence
     const nextTask = { ...task };
     nextTask.id = randomUUID();
+    nextTask.status = "backlog"; // Recurring tasks start in backlog
     nextTask.completed = false;
     nextTask.completionInfo = undefined;
     nextTask.created = new Date().toISOString();
     nextTask.updated = new Date().toISOString();
+    if (index.stats.byStatus) {
+      index.stats.byStatus.backlog++;
+    }
 
-    // Calculate next due date
     const currentDeadline = task.fields.deadline?.value as string;
     if (currentDeadline) {
       const nextDate = new Date(currentDeadline);
@@ -1290,16 +894,89 @@ async function completeTask(taskId: string, config: Config): Promise<Task | null
       };
     }
 
-    saveTask(nextTask);
+    await storage.saveTask(nextTask);
     index.tasks.push(nextTask.id);
     console.log(`\x1b[36m↻ Created next occurrence: ${nextTask.id.slice(0, 8)}\x1b[0m`);
   }
 
-  saveTask(task);
-  archiveTask(task);
+  await storage.saveTask(task);
+  await storage.archiveTask(task);
+  await storage.saveIndex(index);
 
-  // Remove from active tasks but keep in index for history
-  saveIndex(index);
+  return task;
+}
+
+async function activateTask(taskId: string): Promise<Task | null> {
+  const task = await storage.findTaskByPrefix(taskId);
+  if (!task) return null;
+
+  const oldStatus = task.status;
+  task.status = "active";
+  task.completed = false;
+  task.updated = new Date().toISOString();
+
+  const index = await storage.loadIndex();
+  if (index.stats.byStatus) {
+    if (oldStatus && index.stats.byStatus[oldStatus] > 0) {
+      index.stats.byStatus[oldStatus]--;
+    }
+    index.stats.byStatus.active++;
+  }
+
+  await storage.saveTask(task);
+  await storage.saveIndex(index);
+
+  return task;
+}
+
+async function backlogTask(taskId: string): Promise<Task | null> {
+  const task = await storage.findTaskByPrefix(taskId);
+  if (!task) return null;
+
+  const oldStatus = task.status;
+  task.status = "backlog";
+  task.completed = false;
+  task.updated = new Date().toISOString();
+
+  const index = await storage.loadIndex();
+  if (index.stats.byStatus) {
+    if (oldStatus && index.stats.byStatus[oldStatus] > 0) {
+      index.stats.byStatus[oldStatus]--;
+    }
+    index.stats.byStatus.backlog++;
+  }
+
+  await storage.saveTask(task);
+  await storage.saveIndex(index);
+
+  return task;
+}
+
+async function cancelTask(taskId: string, reason?: string): Promise<Task | null> {
+  const task = await storage.findTaskByPrefix(taskId);
+  if (!task) return null;
+
+  const oldStatus = task.status;
+  task.status = "canceled";
+  task.completed = false;
+  task.updated = new Date().toISOString();
+  task.canceledInfo = {
+    canceledAt: new Date().toISOString(),
+    reason,
+  };
+
+  const index = await storage.loadIndex();
+  if (index.stats.byStatus) {
+    if (oldStatus && index.stats.byStatus[oldStatus] > 0) {
+      index.stats.byStatus[oldStatus]--;
+    }
+    index.stats.byStatus.canceled++;
+  }
+  index.stats.totalCanceled = (index.stats.totalCanceled || 0) + 1;
+
+  await storage.saveTask(task);
+  await storage.archiveTask(task);
+  await storage.saveIndex(index);
 
   return task;
 }
@@ -1319,14 +996,12 @@ function formatDate(isoString: string): string {
 }
 
 function formatDeadline(deadline: string): string {
-  // Check if it has a time component
   if (deadline.includes("T")) {
     const [datePart, timePart] = deadline.split("T");
     const date = new Date(deadline);
     if (isNaN(date.getTime())) {
-      // Fallback: try just the date part
       const dateOnly = new Date(datePart + "T00:00:00");
-      if (isNaN(dateOnly.getTime())) return deadline; // Return as-is if unparseable
+      if (isNaN(dateOnly.getTime())) return deadline;
       const [hours, minutes] = timePart.split(":");
       const hour = parseInt(hours) || 0;
       const ampm = hour >= 12 ? "pm" : "am";
@@ -1335,7 +1010,6 @@ function formatDeadline(deadline: string): string {
       return `${dateOnly.toLocaleDateString()} ${timeStr}`;
     }
     const dateStr = date.toLocaleDateString();
-    // Format time as 12-hour with am/pm
     const [hours, minutes] = timePart.split(":");
     const hour = parseInt(hours);
     const ampm = hour >= 12 ? "pm" : "am";
@@ -1344,32 +1018,45 @@ function formatDeadline(deadline: string): string {
     return `${dateStr} ${timeStr}`;
   }
   const date = new Date(deadline + "T00:00:00");
-  if (isNaN(date.getTime())) return deadline; // Return as-is if unparseable
+  if (isNaN(date.getTime())) return deadline;
   return date.toLocaleDateString();
+}
+
+function getStatusIcon(status: TaskStatus): string {
+  switch (status) {
+    case "active":
+      return "\x1b[36m▶\x1b[0m"; // Cyan play
+    case "backlog":
+      return "\x1b[33m○\x1b[0m"; // Yellow circle
+    case "completed":
+      return "\x1b[32m✓\x1b[0m"; // Green check
+    case "canceled":
+      return "\x1b[90m✗\x1b[0m"; // Gray X
+    default:
+      return "\x1b[33m○\x1b[0m";
+  }
 }
 
 function displayTask(task: Task, options: { verbose?: boolean; showRelations?: boolean } = {}) {
   const shortId = task.id.slice(0, 8);
-  const status = task.completed ? "\x1b[32m✓\x1b[0m" : "\x1b[33m○\x1b[0m";
+  const statusIcon = getStatusIcon(task.status || (task.completed ? "completed" : "backlog"));
 
-  // Check for overdue/today
   const deadline = task.fields.deadline?.value as string;
   let deadlineIndicator = "";
-  if (deadline && !task.completed) {
+  if (deadline && task.status !== "completed" && task.status !== "canceled") {
     if (isOverdue(deadline)) {
       deadlineIndicator = " \x1b[31m⚠ OVERDUE\x1b[0m";
     } else if (isToday(deadline)) {
-      // Show time if available
       const timeStr = deadline.includes("T") ? ` @ ${deadline.split("T")[1]}` : "";
       deadlineIndicator = ` \x1b[33m📅 TODAY${timeStr}\x1b[0m`;
     }
   }
 
-  // Check if blocked
   const blockedIndicator = task.blockedBy?.length ? " \x1b[90m🔒 blocked\x1b[0m" : "";
+  const statusLabel = task.status === "active" ? " \x1b[36m[active]\x1b[0m" : "";
 
   const summary = task.fields.summary?.value || task.fields.action?.value || task.raw;
-  console.log(`${status} \x1b[1m${shortId}\x1b[0m  ${summary}${deadlineIndicator}${blockedIndicator}`);
+  console.log(`${statusIcon} \x1b[1m${shortId}\x1b[0m  ${summary}${statusLabel}${deadlineIndicator}${blockedIndicator}`);
 
   if (options.verbose) {
     console.log(`  \x1b[90mRaw: ${task.raw}\x1b[0m`);
@@ -1379,8 +1066,7 @@ function displayTask(task: Task, options: { verbose?: boolean; showRelations?: b
     }
   }
 
-  // Show key fields
-  const keyFields = ["subject", "project", "deadline", "priority", "people", "context", "effort", "energy"];
+  const keyFields = ["scope", "subject", "project", "deadline", "priority", "people", "context", "effort", "energy"];
   const shownFields: string[] = [];
 
   for (const key of keyFields) {
@@ -1399,7 +1085,6 @@ function displayTask(task: Task, options: { verbose?: boolean; showRelations?: b
     }
   }
 
-  // Show other fields
   for (const [key, field] of Object.entries(task.fields)) {
     if (!keyFields.includes(key) && key !== "action" && key !== "summary") {
       shownFields.push(`${key}: \x1b[36m${formatFieldValue(field.value)}\x1b[0m`);
@@ -1423,6 +1108,53 @@ function displayTask(task: Task, options: { verbose?: boolean; showRelations?: b
 }
 
 // ============================================================================
+// SCOPE FILTERING
+// ============================================================================
+
+/**
+ * Filter tasks by the current scope setting
+ */
+async function filterByCurrentScope(tasks: Task[]): Promise<Task[]> {
+  const currentScope = getCurrentScope(config);
+  if (!currentScope) return tasks; // No scope = show all
+  
+  const index = await storage.loadIndex();
+  const scope = index.scopes[currentScope];
+  if (!scope) return tasks; // Invalid scope = show all
+  
+  // Get all subjects in this scope
+  const subjectsInScope = new Set(scope.subjects);
+  
+  return tasks.filter(task => {
+    // Check if task has the scope field directly
+    const taskScope = task.fields.scope?.value;
+    if (taskScope && String(taskScope).toLowerCase() === currentScope.toLowerCase()) {
+      return true;
+    }
+    
+    // Check if task's subject is in the scope
+    const subject = task.fields.subject?.value || task.fields.project?.value;
+    if (subject) {
+      const normalizedSubject = String(subject).toLowerCase().replace(/\s+/g, "_");
+      if (subjectsInScope.has(normalizedSubject)) {
+        return true;
+      }
+    }
+    
+    return false;
+  });
+}
+
+/**
+ * Get scope indicator for display
+ */
+function getScopeIndicator(): string {
+  const currentScope = getCurrentScope(config);
+  if (!currentScope) return "";
+  return `\x1b[35m[${currentScope}]\x1b[0m `;
+}
+
+// ============================================================================
 // LIST & FILTER OPERATIONS
 // ============================================================================
 
@@ -1437,7 +1169,6 @@ interface ListOptions {
 function filterTasks(tasks: Task[], filters: Array<{ field: string; op: string; value: string }>): Task[] {
   return tasks.filter((task) => {
     return filters.every((filter) => {
-      // Special handling for deadline comparisons
       if (filter.field === "deadline") {
         const deadline = task.fields.deadline?.value as string;
         if (!deadline) return false;
@@ -1453,7 +1184,6 @@ function filterTasks(tasks: Task[], filters: Array<{ field: string; op: string; 
         }
       }
 
-      // Special handling for completed
       if (filter.field === "completed") {
         return task.completed === (filter.value === "true");
       }
@@ -1497,11 +1227,15 @@ function groupTasks(tasks: Task[], groupBy: string): Record<string, Task[]> {
   return groups;
 }
 
-function listTasks(options: ListOptions = {}) {
-  let tasks = loadAllTasks(options.showCompleted);
+async function listTasks(options: ListOptions = {}) {
+  let tasks = await storage.loadAllTasks(options.showCompleted);
+
+  // Filter by current scope unless viewing all
+  tasks = await filterByCurrentScope(tasks);
 
   if (tasks.length === 0) {
-    console.log(`\x1b[33mNo tasks found.\x1b[0m`);
+    const scopeIndicator = getScopeIndicator();
+    console.log(`\x1b[33m${scopeIndicator}No tasks found.\x1b[0m`);
     return;
   }
 
@@ -1509,7 +1243,6 @@ function listTasks(options: ListOptions = {}) {
     tasks = filterTasks(tasks, options.filter);
   }
 
-  // Sort
   if (options.sort) {
     tasks.sort((a, b) => {
       const aVal = String(a.fields[options.sort!]?.value || "");
@@ -1517,7 +1250,6 @@ function listTasks(options: ListOptions = {}) {
       return aVal.localeCompare(bVal);
     });
   } else {
-    // Default: sort by deadline, then created
     tasks.sort((a, b) => {
       const aDeadline = a.fields.deadline?.value as string || "9999-99-99";
       const bDeadline = b.fields.deadline?.value as string || "9999-99-99";
@@ -1527,7 +1259,8 @@ function listTasks(options: ListOptions = {}) {
   }
 
   const filterLabel = options.filter?.length ? " filtered" : "";
-  console.log(`\n\x1b[36m┌─ Tasks (${tasks.length}${filterLabel}) ─────────────────────────────────┐\x1b[0m\n`);
+  const scopeIndicator = getScopeIndicator();
+  console.log(`\n\x1b[36m┌─ ${scopeIndicator}Tasks (${tasks.length}${filterLabel}) ─────────────────────────────────┐\x1b[0m\n`);
 
   if (options.groupBy) {
     const groups = groupTasks(tasks, options.groupBy);
@@ -1547,55 +1280,107 @@ function listTasks(options: ListOptions = {}) {
 }
 
 // ============================================================================
-// VIEWS (MATERIALIZED QUERIES)
+// VIEWS
 // ============================================================================
 
-function viewToday() {
-  listTasks({
+async function viewToday() {
+  await listTasks({
     filter: [{ field: "deadline", op: "eq", value: "today" }],
   });
 }
 
-function viewWeek() {
-  listTasks({
+async function viewWeek() {
+  await listTasks({
     filter: [{ field: "deadline", op: "eq", value: "this_week" }],
     sort: "deadline",
   });
 }
 
-function viewOverdue() {
-  listTasks({
+async function viewOverdue() {
+  await listTasks({
     filter: [{ field: "deadline", op: "lt", value: "today" }],
   });
 }
 
-function viewBlocked() {
-  const tasks = loadAllTasks().filter((t) => t.blockedBy?.length);
+async function viewBlocked() {
+  let tasks = (await storage.loadAllTasks()).filter((t) => t.blockedBy?.length);
+  tasks = await filterByCurrentScope(tasks);
+  
+  const scopeIndicator = getScopeIndicator();
   if (tasks.length === 0) {
-    console.log(`\x1b[33mNo blocked tasks.\x1b[0m`);
+    console.log(`\x1b[33m${scopeIndicator}No blocked tasks.\x1b[0m`);
     return;
   }
 
-  console.log(`\n\x1b[36m┌─ Blocked Tasks (${tasks.length}) ─────────────────────────────┐\x1b[0m\n`);
+  console.log(`\n\x1b[36m┌─ ${scopeIndicator}Blocked Tasks (${tasks.length}) ─────────────────────────────┐\x1b[0m\n`);
   for (const task of tasks) {
     displayTask(task, { showRelations: true });
   }
   console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
 }
 
-function viewFocus() {
-  const tasks = loadAllTasks();
+async function viewActive() {
+  const result = await storage.queryTasks({ status: ["active"] });
+  let tasks = await filterByCurrentScope(result.tasks);
+  
+  const scopeIndicator = getScopeIndicator();
+  if (tasks.length === 0) {
+    console.log(`\x1b[33m${scopeIndicator}No active tasks. Use 'tx --activate <id>' to activate a task.\x1b[0m`);
+    return;
+  }
 
-  // Score tasks by urgency
+  console.log(`\n\x1b[36m┌─ ${scopeIndicator}Active Tasks (${tasks.length}) ─────────────────────────────┐\x1b[0m\n`);
+  for (const task of tasks) {
+    displayTask(task, { showRelations: true });
+  }
+  console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
+}
+
+async function viewBacklog() {
+  const result = await storage.queryTasks({ status: ["backlog"] });
+  let tasks = await filterByCurrentScope(result.tasks);
+  
+  const scopeIndicator = getScopeIndicator();
+  if (tasks.length === 0) {
+    console.log(`\x1b[33m${scopeIndicator}Backlog is empty.\x1b[0m`);
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ ${scopeIndicator}Backlog (${tasks.length}) ─────────────────────────────────┐\x1b[0m\n`);
+  for (const task of tasks) {
+    displayTask(task);
+  }
+  console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
+}
+
+async function viewCanceled() {
+  const result = await storage.queryTasks({ status: ["canceled"] });
+  if (result.tasks.length === 0) {
+    console.log(`\x1b[33mNo canceled tasks.\x1b[0m`);
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ Canceled Tasks (${result.tasks.length}) ────────────────────────────┐\x1b[0m\n`);
+  for (const task of result.tasks) {
+    displayTask(task);
+    if (task.canceledInfo?.reason) {
+      console.log(`  \x1b[90mReason: ${task.canceledInfo.reason}\x1b[0m\n`);
+    }
+  }
+  console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
+}
+
+async function viewFocus() {
+  let tasks = await storage.loadAllTasks();
+  tasks = await filterByCurrentScope(tasks);
+
   const scored = tasks.map((task) => {
     let score = 0;
 
-    // Priority
     const priority = String(task.fields.priority?.value || "normal").toLowerCase();
     if (priority === "urgent") score += 100;
     else if (priority === "high") score += 50;
 
-    // Deadline proximity
     const deadline = task.fields.deadline?.value as string;
     if (deadline) {
       if (isOverdue(deadline)) score += 200;
@@ -1603,10 +1388,7 @@ function viewFocus() {
       else if (isThisWeek(deadline)) score += 30;
     }
 
-    // Blocking others
     if (task.blocks?.length) score += 40 * task.blocks.length;
-
-    // Being blocked (negative - can't do it anyway)
     if (task.blockedBy?.length) score -= 50;
 
     return { task, score };
@@ -1615,12 +1397,13 @@ function viewFocus() {
   scored.sort((a, b) => b.score - a.score);
   const top = scored.slice(0, 5);
 
-  console.log(`\n\x1b[36m┌─ 🎯 Focus: Top Tasks ─────────────────────────────┐\x1b[0m\n`);
+  const scopeIndicator = getScopeIndicator();
+  console.log(`\n\x1b[36m┌─ 🎯 ${scopeIndicator}Focus: Top Tasks ─────────────────────────────┐\x1b[0m\n`);
 
   if (top.length === 0) {
     console.log(`  \x1b[33mNo tasks to focus on!\x1b[0m\n`);
   } else {
-    for (const { task, score } of top) {
+    for (const { task } of top) {
       displayTask(task);
     }
   }
@@ -1632,8 +1415,8 @@ function viewFocus() {
 // STRUCTURES & ALIASES
 // ============================================================================
 
-function showStructures() {
-  const index = loadIndex();
+async function showStructures() {
+  const index = await storage.loadIndex();
 
   if (Object.keys(index.structures).length === 0) {
     console.log(`\x1b[33mNo semantic structures discovered yet.\x1b[0m`);
@@ -1663,8 +1446,8 @@ function showStructures() {
   console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
 }
 
-function showSchema(outputJson = false) {
-  const schema = loadSchema();
+async function showSchema(outputJson = false) {
+  const schema = await storage.loadSchema();
 
   if (outputJson) {
     console.log(JSON.stringify(schema, null, 2));
@@ -1723,11 +1506,11 @@ function showSchema(outputJson = false) {
   }
 
   console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m`);
-  console.log(`\n\x1b[90mSchema file: ${SCHEMA_PATH}\x1b[0m\n`);
+  console.log(`\n\x1b[90mConfig: ${getDataDir()}\x1b[0m\n`);
 }
 
-function addSchemaField(name: string, type: string, description: string) {
-  const schema = loadSchema();
+async function addSchemaField(name: string, type: string, description: string) {
+  const schema = await storage.loadSchema();
 
   const validTypes = ["string", "date", "datetime", "number", "boolean", "array", "duration"];
   if (!validTypes.includes(type)) {
@@ -1742,7 +1525,7 @@ function addSchemaField(name: string, type: string, description: string) {
   });
 
   if (added) {
-    saveSchema(schema);
+    await storage.saveSchema(schema);
     console.log(`\x1b[32m✓ Added field "${name}" (${type}) to schema\x1b[0m`);
     return true;
   } else {
@@ -1751,8 +1534,8 @@ function addSchemaField(name: string, type: string, description: string) {
   }
 }
 
-function showAliases() {
-  const index = loadIndex();
+async function showAliases() {
+  const index = await storage.loadIndex();
 
   if (Object.keys(index.aliases).length === 0) {
     console.log(`\x1b[33mNo aliases discovered yet.\x1b[0m`);
@@ -1769,8 +1552,8 @@ function showAliases() {
   console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
 }
 
-function mergeAliases(canonical: string, variant: string) {
-  const index = loadIndex();
+async function mergeAliases(canonical: string, variant: string) {
+  const index = await storage.loadIndex();
 
   if (!index.aliases[canonical]) {
     index.aliases[canonical] = [];
@@ -1779,7 +1562,7 @@ function mergeAliases(canonical: string, variant: string) {
     index.aliases[canonical].push(variant);
   }
 
-  saveIndex(index);
+  await storage.saveIndex(index);
   console.log(`\x1b[32m✓ Merged: "${variant}" → "${canonical}"\x1b[0m`);
 }
 
@@ -1787,8 +1570,184 @@ function mergeAliases(canonical: string, variant: string) {
 // TEMPLATES
 // ============================================================================
 
-function showTemplates() {
-  const index = loadIndex();
+// ============================================================================
+// SCOPE MANAGEMENT
+// ============================================================================
+
+async function createScope(name: string, options: { description?: string; icon?: string; color?: string; parent?: string } = {}): Promise<Scope> {
+  const index = await storage.loadIndex();
+  
+  // Generate ID from name
+  const id = name.toLowerCase().replace(/\s+/g, "_");
+  
+  if (index.scopes[id]) {
+    throw new Error(`Scope "${name}" already exists`);
+  }
+  
+  const scope: Scope = {
+    id,
+    name,
+    description: options.description,
+    icon: options.icon,
+    color: options.color,
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    subjects: [],
+    parent: options.parent,
+  };
+  
+  index.scopes[id] = scope;
+  await storage.saveIndex(index);
+  
+  return scope;
+}
+
+async function assignSubjectToScope(subject: string, scopeId: string): Promise<void> {
+  const index = await storage.loadIndex();
+  
+  const normalizedSubject = subject.toLowerCase().replace(/\s+/g, "_");
+  
+  if (!index.scopes[scopeId]) {
+    throw new Error(`Scope "${scopeId}" not found`);
+  }
+  
+  // Remove from old scope if assigned
+  const oldScopeId = index.subjectScopes[normalizedSubject];
+  if (oldScopeId && index.scopes[oldScopeId]) {
+    index.scopes[oldScopeId].subjects = index.scopes[oldScopeId].subjects.filter(s => s !== normalizedSubject);
+  }
+  
+  // Add to new scope
+  index.subjectScopes[normalizedSubject] = scopeId;
+  if (!index.scopes[scopeId].subjects.includes(normalizedSubject)) {
+    index.scopes[scopeId].subjects.push(normalizedSubject);
+  }
+  index.scopes[scopeId].updated = new Date().toISOString();
+  
+  await storage.saveIndex(index);
+}
+
+async function showScopes() {
+  const index = await storage.loadIndex();
+  
+  const scopes = Object.values(index.scopes);
+  if (scopes.length === 0) {
+    console.log(`\x1b[33mNo scopes defined. Create one with: tx --scope-add <name>\x1b[0m`);
+    return;
+  }
+  
+  console.log(`\n\x1b[36m┌─ Scopes ───────────────────────────────────────────┐\x1b[0m\n`);
+  
+  // Build tree structure
+  const rootScopes = scopes.filter(s => !s.parent);
+  const childScopes = scopes.filter(s => s.parent);
+  
+  function displayScope(scope: Scope, indent = "") {
+    const icon = scope.icon ? `${scope.icon} ` : "";
+    const subjectCount = scope.subjects.length;
+    const subjectsLabel = subjectCount > 0 ? ` \x1b[90m(${subjectCount} subject${subjectCount !== 1 ? 's' : ''})\x1b[0m` : "";
+    
+    console.log(`${indent}${icon}\x1b[1m${scope.name}\x1b[0m${subjectsLabel}`);
+    
+    if (scope.description) {
+      console.log(`${indent}  \x1b[90m${scope.description}\x1b[0m`);
+    }
+    
+    if (scope.subjects.length > 0) {
+      console.log(`${indent}  \x1b[90mSubjects: ${scope.subjects.join(", ")}\x1b[0m`);
+    }
+    
+    // Show children
+    const children = childScopes.filter(s => s.parent === scope.id);
+    for (const child of children) {
+      displayScope(child, indent + "  ");
+    }
+    
+    console.log();
+  }
+  
+  for (const scope of rootScopes) {
+    displayScope(scope);
+  }
+  
+  console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
+}
+
+async function viewScope(scopeId: string) {
+  const index = await storage.loadIndex();
+  
+  const scope = index.scopes[scopeId] || Object.values(index.scopes).find(s => s.name.toLowerCase() === scopeId.toLowerCase());
+  
+  if (!scope) {
+    console.error(`\x1b[31mScope not found: ${scopeId}\x1b[0m`);
+    console.log(`\x1b[33mAvailable scopes: ${Object.keys(index.scopes).join(", ") || "none"}\x1b[0m`);
+    return;
+  }
+  
+  // Get all subjects in this scope (and child scopes)
+  const scopeIds = [scope.id];
+  // Add child scope IDs
+  for (const s of Object.values(index.scopes)) {
+    if (s.parent === scope.id) {
+      scopeIds.push(s.id);
+    }
+  }
+  
+  const subjectsInScope = new Set<string>();
+  for (const sid of scopeIds) {
+    const s = index.scopes[sid];
+    if (s) {
+      for (const subject of s.subjects) {
+        subjectsInScope.add(subject);
+      }
+    }
+  }
+  
+  // Filter tasks by subjects in scope
+  const allTasks = await storage.loadAllTasks();
+  const tasksInScope = allTasks.filter(task => {
+    const subject = task.fields.subject?.value || task.fields.project?.value;
+    if (!subject) return false;
+    const normalizedSubject = String(subject).toLowerCase().replace(/\s+/g, "_");
+    return subjectsInScope.has(normalizedSubject);
+  });
+  
+  const icon = scope.icon ? `${scope.icon} ` : "";
+  console.log(`\n\x1b[36m┌─ ${icon}${scope.name} (${tasksInScope.length} tasks) ─────────────────────────────┐\x1b[0m\n`);
+  
+  if (scope.description) {
+    console.log(`  \x1b[90m${scope.description}\x1b[0m\n`);
+  }
+  
+  if (tasksInScope.length === 0) {
+    console.log(`  \x1b[33mNo tasks in this scope.\x1b[0m`);
+    if (scope.subjects.length === 0) {
+      console.log(`  \x1b[90mAssign subjects with: tx --scope-assign <subject> ${scope.id}\x1b[0m`);
+    }
+  } else {
+    // Group by subject
+    const bySubject: Record<string, Task[]> = {};
+    for (const task of tasksInScope) {
+      const subject = String(task.fields.subject?.value || task.fields.project?.value || "other");
+      if (!bySubject[subject]) {
+        bySubject[subject] = [];
+      }
+      bySubject[subject].push(task);
+    }
+    
+    for (const [subject, tasks] of Object.entries(bySubject)) {
+      console.log(`\x1b[35m━━ ${subject} (${tasks.length}) ━━\x1b[0m\n`);
+      for (const task of tasks) {
+        displayTask(task);
+      }
+    }
+  }
+  
+  console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
+}
+
+async function showTemplates() {
+  const index = await storage.loadIndex();
 
   if (Object.keys(index.templates).length === 0) {
     console.log(`\x1b[33mNo templates discovered yet.\x1b[0m`);
@@ -1814,9 +1773,8 @@ function showTemplates() {
 // STATS & REVIEW
 // ============================================================================
 
-function showStats() {
-  const index = loadIndex();
-  const tasks = loadAllTasks(true);
+async function showStats() {
+  const index = await storage.loadIndex();
 
   console.log(`\n\x1b[36m┌─ Task Statistics ──────────────────────────────────┐\x1b[0m\n`);
 
@@ -1828,7 +1786,6 @@ function showStats() {
     : 0;
   console.log(`  Completion rate: ${completionRate}%\n`);
 
-  // By project
   if (Object.keys(index.stats.completionsByProject).length > 0) {
     console.log(`  \x1b[1mBy Project\x1b[0m`);
     const sorted = Object.entries(index.stats.completionsByProject)
@@ -1840,7 +1797,6 @@ function showStats() {
     console.log();
   }
 
-  // Average duration by type
   if (Object.keys(index.stats.averageDuration).length > 0) {
     console.log(`  \x1b[1mAverage Duration by Type\x1b[0m`);
     for (const [type, mins] of Object.entries(index.stats.averageDuration)) {
@@ -1852,7 +1808,6 @@ function showStats() {
     console.log();
   }
 
-  // Recent completions
   const recentDays = Object.entries(index.stats.completionsByDay)
     .sort(([a], [b]) => b.localeCompare(a))
     .slice(0, 7);
@@ -1866,13 +1821,11 @@ function showStats() {
   console.log(`\n\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
 }
 
-async function interactiveReview(config: Config) {
-  const tasks = loadAllTasks();
-  const today = getToday();
+async function interactiveReview() {
+  const tasks = await storage.loadAllTasks();
 
   console.log(`\n\x1b[36m┌─ Daily Review ─────────────────────────────────────┐\x1b[0m\n`);
 
-  // Overdue tasks
   const overdue = tasks.filter((t) => {
     const deadline = t.fields.deadline?.value as string;
     return deadline && isOverdue(deadline);
@@ -1885,7 +1838,6 @@ async function interactiveReview(config: Config) {
     }
   }
 
-  // Today's tasks
   const todayTasks = tasks.filter((t) => {
     const deadline = t.fields.deadline?.value as string;
     return deadline && isToday(deadline);
@@ -1898,13 +1850,11 @@ async function interactiveReview(config: Config) {
     }
   }
 
-  // Blocked tasks check
   const blocked = tasks.filter((t) => t.blockedBy?.length);
   if (blocked.length > 0) {
     console.log(`\x1b[90m🔒 Blocked (${blocked.length})\x1b[0m\n`);
   }
 
-  // Top priority
   const urgent = tasks.filter((t) =>
     String(t.fields.priority?.value).toLowerCase() === "urgent"
   );
@@ -1916,8 +1866,6 @@ async function interactiveReview(config: Config) {
   }
 
   console.log(`\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
-
-  // Summary
   console.log(`\x1b[90mTotal open tasks: ${tasks.length}\x1b[0m`);
 }
 
@@ -1925,8 +1873,8 @@ async function interactiveReview(config: Config) {
 // EXPORT
 // ============================================================================
 
-function exportTasks(format: string) {
-  const tasks = loadAllTasks(true);
+async function exportTasks(format: string) {
+  const tasks = await storage.loadAllTasks(true);
 
   switch (format) {
     case "json":
@@ -1983,8 +1931,8 @@ function exportTasks(format: string) {
 // DEPENDENCY GRAPH
 // ============================================================================
 
-function showGraph() {
-  const tasks = loadAllTasks();
+async function showGraph() {
+  const tasks = await storage.loadAllTasks();
 
   const hasRelations = tasks.some((t) => t.blocks?.length || t.blockedBy?.length);
 
@@ -2001,7 +1949,7 @@ function showGraph() {
       console.log(`  \x1b[1m${task.id.slice(0, 8)}\x1b[0m ${summary}`);
 
       for (const blockedId of task.blocks) {
-        const blocked = loadTask(blockedId);
+        const blocked = await storage.loadTask(blockedId);
         if (blocked) {
           const blockedSummary = String(blocked.fields.summary?.value || blockedId.slice(0, 8));
           console.log(`    └─▶ \x1b[90m${blockedId.slice(0, 8)}\x1b[0m ${blockedSummary}`);
@@ -2018,7 +1966,7 @@ function showGraph() {
 // HELP
 // ============================================================================
 
-function showHelp(config: Config) {
+function showHelp() {
   console.log(`
 \x1b[36m┌─────────────────────────────────────────┐
 │  \x1b[1mtx\x1b[0m\x1b[36m - Semantic Task Management          │
@@ -2029,7 +1977,10 @@ function showHelp(config: Config) {
   tx <task> --blocks <task-id>      Add with dependency
 
 \x1b[33mViews:\x1b[0m
-  tx --list                         All open tasks
+  tx --list                         All open tasks (active + backlog)
+  tx --active                       Currently active tasks
+  tx --backlog                      Tasks in backlog
+  tx --canceled                     Canceled tasks
   tx --today                        Due today
   tx --week                         Due this week
   tx --overdue                      Past deadline
@@ -2042,7 +1993,10 @@ function showHelp(config: Config) {
   tx --q "<natural language>"       Natural language query
 
 \x1b[33mTask Management:\x1b[0m
+  tx --activate <id>                Start working on a task
+  tx --backlog-task <id>            Move task back to backlog
   tx --complete <id>                Complete task (tracks duration)
+  tx --cancel <id> [--reason <r>]   Cancel a task
   tx --delete <id>                  Delete task permanently
   tx --graph                        Show dependency graph
 
@@ -2050,6 +2004,15 @@ function showHelp(config: Config) {
   tx --schema                       View the semantic schema
   tx --schema --json                Output schema as JSON
   tx --schema-add <name> <type> <desc>  Add a field to schema
+
+\x1b[33mScopes:\x1b[0m
+  tx --use-scope <scope>            Set active scope (namespace)
+  tx --unset-scope                  Clear scope (global mode)
+  tx --current-scope                Show current scope
+  tx --scopes                       List all scopes
+  tx --scope <name>                 View tasks in a scope
+  tx --scope-add <name> [opts]      Create scope (--desc, --icon, --parent)
+  tx --scope-assign <subject> <scope>  Assign subject to scope
 
 \x1b[33mSemantics:\x1b[0m
   tx --structures                   Discovered field usage stats
@@ -2064,10 +2027,21 @@ function showHelp(config: Config) {
 \x1b[33mExport:\x1b[0m
   tx --export json|markdown|ical    Export tasks
 
+\x1b[33mServer:\x1b[0m
+  tx --serve                        Start tRPC server (default port: 3847)
+  tx --serve --port <port>          Start on custom port
+
 \x1b[33mConfig:\x1b[0m
-  Provider: \x1b[1m${config.provider}\x1b[0m
-  Storage: ${TASKS_DIR}/
+  tx --config                       Show configuration
+  Provider: \x1b[1m${config.llm.provider}\x1b[0m
+  Storage: ${getStorageTypeName(config.storage)}
 `);
+}
+
+async function showConfig() {
+  console.log(`\n\x1b[36m┌─ TX Configuration ─────────────────────────────────┐\x1b[0m\n`);
+  console.log(describeConfig(config));
+  console.log(`\n\x1b[36m└────────────────────────────────────────────────────┘\x1b[0m\n`);
 }
 
 // ============================================================================
@@ -2085,9 +2059,11 @@ function parseArgs(args: string[]): ParsedArgs {
 
   if (args.length === 0) return result;
 
-  // Simple commands
   const simpleCommands: Record<string, string> = {
     "--list": "list",
+    "--active": "active",
+    "--backlog": "backlog-view",
+    "--canceled": "canceled",
     "--today": "today",
     "--week": "week",
     "--overdue": "overdue",
@@ -2099,14 +2075,22 @@ function parseArgs(args: string[]): ParsedArgs {
     "--review": "review",
     "--stats": "stats",
     "--graph": "graph",
+    "--config": "config",
+    "--serve": "serve",
+    "--scopes": "scopes",
+    "--current-scope": "current-scope",
+    "--unset-scope": "unset-scope",
   };
 
   if (simpleCommands[args[0]]) {
     result.command = simpleCommands[args[0]];
+    // Parse --port for serve command
+    if (args[0] === "--serve" && args[1] === "--port" && args[2]) {
+      result.params.port = args[2];
+    }
     return result;
   }
 
-  // Schema commands
   if (args[0] === "--schema") {
     result.command = "schema";
     if (args[1] === "--json") {
@@ -2123,7 +2107,6 @@ function parseArgs(args: string[]): ParsedArgs {
     return result;
   }
 
-  // Commands with parameters
   if (args[0] === "--by" && args[1]) {
     result.command = "by";
     result.params.field = args[1];
@@ -2170,6 +2153,67 @@ function parseArgs(args: string[]): ParsedArgs {
     return result;
   }
 
+  if (args[0] === "--activate") {
+    result.command = "activate";
+    result.params.id = args[1] || "";
+    return result;
+  }
+
+  if (args[0] === "--backlog-task") {
+    result.command = "backlog-task";
+    result.params.id = args[1] || "";
+    return result;
+  }
+
+  if (args[0] === "--cancel") {
+    result.command = "cancel";
+    result.params.id = args[1] || "";
+    // Check for --reason flag
+    const reasonIdx = args.indexOf("--reason");
+    if (reasonIdx !== -1 && args[reasonIdx + 1]) {
+      result.params.reason = args.slice(reasonIdx + 1).join(" ");
+    }
+    return result;
+  }
+
+  if (args[0] === "--scope") {
+    result.command = "scope-view";
+    result.params.scopeId = args[1] || "";
+    return result;
+  }
+
+  if (args[0] === "--scope-add") {
+    result.command = "scope-add";
+    result.params.name = args[1] || "";
+    // Parse optional flags
+    const descIdx = args.indexOf("--desc");
+    if (descIdx !== -1 && args[descIdx + 1]) {
+      result.params.description = args[descIdx + 1];
+    }
+    const iconIdx = args.indexOf("--icon");
+    if (iconIdx !== -1 && args[iconIdx + 1]) {
+      result.params.icon = args[iconIdx + 1];
+    }
+    const parentIdx = args.indexOf("--parent");
+    if (parentIdx !== -1 && args[parentIdx + 1]) {
+      result.params.parent = args[parentIdx + 1];
+    }
+    return result;
+  }
+
+  if (args[0] === "--scope-assign") {
+    result.command = "scope-assign";
+    result.params.subject = args[1] || "";
+    result.params.scopeId = args[2] || "";
+    return result;
+  }
+
+  if (args[0] === "--use-scope") {
+    result.command = "use-scope";
+    result.params.scopeId = args[1] || "";
+    return result;
+  }
+
   if (args[0] === "--export") {
     result.command = "export";
     result.params.format = args[1] || "json";
@@ -2183,10 +2227,8 @@ function parseArgs(args: string[]): ParsedArgs {
     return result;
   }
 
-  // Default: add task
   result.command = "add";
 
-  // Check for --blocks flag
   const blocksIdx = args.indexOf("--blocks");
   if (blocksIdx !== -1 && args[blocksIdx + 1]) {
     result.params.blocks = args[blocksIdx + 1];
@@ -2202,18 +2244,24 @@ function parseArgs(args: string[]): ParsedArgs {
 // ============================================================================
 
 async function main() {
-  const config = loadConfig();
+  // Load configuration
+  config = loadConfig();
+  
+  // Create storage instance
+  storage = createStorage(config.storage);
+  await storage.initialize();
+
   const args = process.argv.slice(2);
   const { command, params, flags } = parseArgs(args);
 
   try {
     switch (command) {
       case "help":
-        showHelp(config);
+        showHelp();
         break;
 
       case "add":
-        const { tasks: createdTasks, schemaUpdated } = await addTasks(params.raw, config, { blocks: params.blocks });
+        const { tasks: createdTasks, schemaUpdated } = await addTasks(params.raw, { blocks: params.blocks });
         const taskWord = createdTasks.length === 1 ? "Task" : "Tasks";
         console.log(`\n\x1b[32m✓ ${createdTasks.length} ${taskWord} added\x1b[0m${schemaUpdated ? " \x1b[35m(schema updated)\x1b[0m" : ""}\n`);
         for (const task of createdTasks) {
@@ -2222,31 +2270,43 @@ async function main() {
         break;
 
       case "list":
-        listTasks();
+        await listTasks();
         break;
 
       case "today":
-        viewToday();
+        await viewToday();
         break;
 
       case "week":
-        viewWeek();
+        await viewWeek();
         break;
 
       case "overdue":
-        viewOverdue();
+        await viewOverdue();
         break;
 
       case "blocked":
-        viewBlocked();
+        await viewBlocked();
+        break;
+
+      case "active":
+        await viewActive();
+        break;
+
+      case "backlog-view":
+        await viewBacklog();
+        break;
+
+      case "canceled":
+        await viewCanceled();
         break;
 
       case "focus":
-        viewFocus();
+        await viewFocus();
         break;
 
       case "by":
-        listTasks({ groupBy: params.field });
+        await listTasks({ groupBy: params.field });
         break;
 
       case "query":
@@ -2254,7 +2314,7 @@ async function main() {
           console.error(`\x1b[31mUsage: tx --query <field> --eq <value>\x1b[0m`);
           process.exit(1);
         }
-        listTasks({
+        await listTasks({
           filter: [{ field: params.field, op: params.op || "eq", value: params.value }],
         });
         break;
@@ -2265,9 +2325,9 @@ async function main() {
           process.exit(1);
         }
         console.log(`\x1b[90m⏳ Parsing query...\x1b[0m`);
-        const index = loadIndex();
-        const parsed = await naturalLanguageQuery(params.query, config, index);
-        listTasks({ filter: parsed.filters, groupBy: parsed.groupBy, sort: parsed.sort });
+        const index = await storage.loadIndex();
+        const parsed = await naturalLanguageQuery(params.query, index);
+        await listTasks({ filter: parsed.filters, groupBy: parsed.groupBy, sort: parsed.sort });
         break;
 
       case "complete":
@@ -2275,7 +2335,7 @@ async function main() {
           console.error(`\x1b[31mUsage: tx --complete <task-id>\x1b[0m`);
           process.exit(1);
         }
-        const completed = await completeTask(params.id, config);
+        const completed = await completeTask(params.id);
         if (completed) {
           console.log(`\x1b[32m✓ Task completed: ${completed.id.slice(0, 8)}\x1b[0m`);
         } else {
@@ -2289,7 +2349,7 @@ async function main() {
           console.error(`\x1b[31mUsage: tx --delete <task-id>\x1b[0m`);
           process.exit(1);
         }
-        const deleted = deleteTask(params.id);
+        const deleted = await deleteTask(params.id);
         if (deleted) {
           console.log(`\x1b[32m✓ Task deleted: ${deleted.id.slice(0, 8)}\x1b[0m`);
         } else {
@@ -2298,8 +2358,51 @@ async function main() {
         }
         break;
 
+      case "activate":
+        if (!params.id) {
+          console.error(`\x1b[31mUsage: tx --activate <task-id>\x1b[0m`);
+          process.exit(1);
+        }
+        const activated = await activateTask(params.id);
+        if (activated) {
+          console.log(`\x1b[36m▶ Task activated: ${activated.id.slice(0, 8)}\x1b[0m`);
+          displayTask(activated);
+        } else {
+          console.error(`\x1b[31mTask not found: ${params.id}\x1b[0m`);
+          process.exit(1);
+        }
+        break;
+
+      case "backlog-task":
+        if (!params.id) {
+          console.error(`\x1b[31mUsage: tx --backlog-task <task-id>\x1b[0m`);
+          process.exit(1);
+        }
+        const backlogged = await backlogTask(params.id);
+        if (backlogged) {
+          console.log(`\x1b[33m○ Task moved to backlog: ${backlogged.id.slice(0, 8)}\x1b[0m`);
+        } else {
+          console.error(`\x1b[31mTask not found: ${params.id}\x1b[0m`);
+          process.exit(1);
+        }
+        break;
+
+      case "cancel":
+        if (!params.id) {
+          console.error(`\x1b[31mUsage: tx --cancel <task-id> [--reason <reason>]\x1b[0m`);
+          process.exit(1);
+        }
+        const canceled = await cancelTask(params.id, params.reason);
+        if (canceled) {
+          console.log(`\x1b[90m✗ Task canceled: ${canceled.id.slice(0, 8)}\x1b[0m`);
+        } else {
+          console.error(`\x1b[31mTask not found: ${params.id}\x1b[0m`);
+          process.exit(1);
+        }
+        break;
+
       case "schema":
-        showSchema(flags.has("json"));
+        await showSchema(flags.has("json"));
         break;
 
       case "schema-add":
@@ -2308,15 +2411,15 @@ async function main() {
           console.log(`\x1b[33mTypes: string, date, number, boolean, array, duration\x1b[0m`);
           process.exit(1);
         }
-        addSchemaField(params.name, params.type, params.description || `Field: ${params.name}`);
+        await addSchemaField(params.name, params.type, params.description || `Field: ${params.name}`);
         break;
 
       case "structures":
-        showStructures();
+        await showStructures();
         break;
 
       case "aliases":
-        showAliases();
+        await showAliases();
         break;
 
       case "merge":
@@ -2324,37 +2427,138 @@ async function main() {
           console.error(`\x1b[31mUsage: tx --merge <canonical> <variant>\x1b[0m`);
           process.exit(1);
         }
-        mergeAliases(params.canonical, params.variant);
+        await mergeAliases(params.canonical, params.variant);
         break;
 
       case "templates":
-        showTemplates();
+        await showTemplates();
+        break;
+
+      case "scopes":
+        await showScopes();
+        break;
+
+      case "scope-view":
+        if (!params.scopeId) {
+          console.error(`\x1b[31mUsage: tx --scope <scope-name>\x1b[0m`);
+          process.exit(1);
+        }
+        await viewScope(params.scopeId);
+        break;
+
+      case "scope-add":
+        if (!params.name) {
+          console.error(`\x1b[31mUsage: tx --scope-add <name> [--desc <description>] [--icon <emoji>] [--parent <scope-id>]\x1b[0m`);
+          process.exit(1);
+        }
+        try {
+          const newScope = await createScope(params.name, {
+            description: params.description,
+            icon: params.icon,
+            parent: params.parent,
+          });
+          console.log(`\x1b[32m✓ Created scope: ${newScope.icon || ""}${newScope.name}\x1b[0m`);
+        } catch (error) {
+          console.error(`\x1b[31m${(error as Error).message}\x1b[0m`);
+          process.exit(1);
+        }
+        break;
+
+      case "scope-assign":
+        if (!params.subject || !params.scopeId) {
+          console.error(`\x1b[31mUsage: tx --scope-assign <subject> <scope-id>\x1b[0m`);
+          process.exit(1);
+        }
+        try {
+          await assignSubjectToScope(params.subject, params.scopeId);
+          console.log(`\x1b[32m✓ Assigned "${params.subject}" to scope "${params.scopeId}"\x1b[0m`);
+        } catch (error) {
+          console.error(`\x1b[31m${(error as Error).message}\x1b[0m`);
+          process.exit(1);
+        }
+        break;
+
+      case "use-scope":
+        if (!params.scopeId) {
+          console.error(`\x1b[31mUsage: tx --use-scope <scope-id>\x1b[0m`);
+          process.exit(1);
+        }
+        {
+          const index = await storage.loadIndex();
+          if (!index.scopes[params.scopeId]) {
+            console.error(`\x1b[31mScope not found: ${params.scopeId}\x1b[0m`);
+            console.log(`\x1b[33mAvailable scopes: ${Object.keys(index.scopes).join(", ") || "none"}\x1b[0m`);
+            process.exit(1);
+          }
+          config = setCurrentScope(config, params.scopeId);
+          const scope = index.scopes[params.scopeId];
+          console.log(`\x1b[32m✓ Now using scope: ${scope.icon || ""}${scope.name}\x1b[0m`);
+          console.log(`\x1b[90m  All new tasks will be created in this scope.\x1b[0m`);
+        }
+        break;
+
+      case "unset-scope":
+        config = setCurrentScope(config, null);
+        console.log(`\x1b[32m✓ Scope unset. Operating in global mode.\x1b[0m`);
+        break;
+
+      case "current-scope":
+        {
+          const currentScope = getCurrentScope(config);
+          if (currentScope) {
+            const index = await storage.loadIndex();
+            const scope = index.scopes[currentScope];
+            if (scope) {
+              console.log(`\x1b[36mCurrent scope: ${scope.icon || ""}${scope.name}\x1b[0m`);
+              if (scope.description) {
+                console.log(`\x1b[90m  ${scope.description}\x1b[0m`);
+              }
+            } else {
+              console.log(`\x1b[33mCurrent scope "${currentScope}" no longer exists.\x1b[0m`);
+            }
+          } else {
+            console.log(`\x1b[33mNo scope set. Operating in global mode.\x1b[0m`);
+            console.log(`\x1b[90m  Use 'tx --use-scope <scope>' to set a scope.\x1b[0m`);
+          }
+        }
         break;
 
       case "review":
-        await interactiveReview(config);
+        await interactiveReview();
         break;
 
       case "stats":
-        showStats();
+        await showStats();
         break;
 
       case "export":
-        exportTasks(params.format);
+        await exportTasks(params.format);
         break;
 
       case "graph":
-        showGraph();
+        await showGraph();
         break;
 
+      case "config":
+        await showConfig();
+        break;
+
+      case "serve":
+        const port = params.port ? parseInt(params.port, 10) : undefined;
+        await startServerCLI(port);
+        return; // Server runs until interrupted
+
       default:
-        showHelp(config);
+        showHelp();
     }
   } catch (error) {
     if (error instanceof Error) {
       console.error(`\n\x1b[31m✗ Error:\x1b[0m ${error.message}`);
     }
     process.exit(1);
+  } finally {
+    // Clean up storage
+    await storage.close();
   }
 }
 

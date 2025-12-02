@@ -1,23 +1,53 @@
 {
   "name": "tx",
-  "version": "1.0.0",
-  "description": "Natural language to shell command CLI with tool calling support",
+  "version": "2.0.0",
+  "description": "Semantic task management with AI-powered extraction and multiple storage backends",
   "type": "module",
   "main": "dist/tx.js",
   "bin": {
     "tx": "./dist/tx.js"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/types/index.js"
+    },
+    "./types": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/types/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js"
+    },
+    "./config": {
+      "types": "./dist/config/index.d.ts",
+      "import": "./dist/config/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/tx.js",
-    "dev": "tsx src/tx.ts"
+    "dev": "tsx src/tx.ts",
+    "serve": "node dist/tx.js --serve"
   },
   "keywords": [
     "cli",
     "ai",
     "bedrock",
     "shell",
-    "langchain"
+    "langchain",
+    "task-management",
+    "semantic",
+    "trpc"
   ],
   "author": "",
   "license": "MIT",
@@ -25,11 +55,21 @@
     "@langchain/aws": "^0.1.4",
     "@langchain/core": "^0.3.19",
     "@langchain/openai": "^0.3.14",
+    "@trpc/client": "^10.45.2",
+    "@trpc/server": "^10.45.2",
     "langchain": "^0.3.7",
+    "ws": "^8.18.0",
     "zod": "^3.23.8"
   },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.6.0",
+    "pg": "^8.13.1"
+  },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.9.0",
+    "@types/pg": "^8.11.10",
+    "@types/ws": "^8.5.13",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
   }
