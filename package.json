@@ -1,0 +1,36 @@
+{
+  "name": "tx",
+  "version": "1.0.0",
+  "description": "Natural language to shell command CLI with tool calling support",
+  "type": "module",
+  "main": "dist/tx.js",
+  "bin": {
+    "tx": "./dist/tx.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/tx.js",
+    "dev": "tsx src/tx.ts"
+  },
+  "keywords": [
+    "cli",
+    "ai",
+    "bedrock",
+    "shell",
+    "langchain"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@langchain/aws": "^0.1.4",
+    "@langchain/core": "^0.3.19",
+    "@langchain/openai": "^0.3.14",
+    "langchain": "^0.3.7",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
