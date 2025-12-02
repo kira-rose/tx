@@ -306,6 +306,7 @@ function NoteItem({
 }: NoteItemProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState(note.raw);
+  const [fieldsExpanded, setFieldsExpanded] = useState(false);
 
   const title = note.title || note.raw.substring(0, 60);
   const hasMoreContent = note.raw.length > 60 || Object.keys(note.fields).length > 0;
@@ -402,25 +403,54 @@ function NoteItem({
             </div>
           ) : (
             <>
+              {/* All Tags */}
+              {note.tags.length > 0 && (
+                <div className="note-all-tags">
+                  {note.tags.map((tag) => (
+                    <button
+                      key={tag}
+                      className="note-tag"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onTagClick(tag);
+                      }}
+                    >
+                      #{tag}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Note Content */}
               <div className="note-full-content">
                 <ReactMarkdown>{note.raw}</ReactMarkdown>
               </div>
 
+              {/* Collapsible Extracted Fields */}
               {fieldCount > 0 && (
-                <div className="note-fields">
-                  <h4>Extracted Fields</h4>
-                  <div className="fields-grid">
-                    {Object.entries(note.fields).map(([key, field]) => (
-                      <div key={key} className="field-item">
-                        <span className="field-name">{key}</span>
-                        <span className="field-value">
-                          {Array.isArray(field.value)
-                            ? field.value.join(", ")
-                            : String(field.value)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
+                <div className={`note-fields ${fieldsExpanded ? "expanded" : ""}`}>
+                  <button 
+                    className="note-fields-header"
+                    onClick={() => setFieldsExpanded(!fieldsExpanded)}
+                  >
+                    <span className="fields-toggle-icon">{fieldsExpanded ? "▾" : "▸"}</span>
+                    <span>Extracted Fields</span>
+                    <span className="fields-count">{fieldCount}</span>
+                  </button>
+                  {fieldsExpanded && (
+                    <div className="fields-grid">
+                      {Object.entries(note.fields).map(([key, field]) => (
+                        <div key={key} className="field-item">
+                          <span className="field-name">{key}</span>
+                          <span className="field-value">
+                            {Array.isArray(field.value)
+                              ? field.value.join(", ")
+                              : String(field.value)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
