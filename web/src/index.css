@@ -1,0 +1,210 @@
+:root {
+  /* Warm paper light theme with terracotta accents */
+  --bg-primary: #faf8f5;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #f5f3f0;
+  --bg-hover: #efede9;
+  --bg-active: #e8e5e0;
+
+  --text-primary: #1a1a1a;
+  --text-secondary: #525252;
+  --text-muted: #737373;
+  --text-faint: #a3a3a3;
+
+  /* Status colors */
+  --status-active: #059669;
+  --status-active-bg: rgba(5, 150, 105, 0.1);
+  --status-backlog: #d97706;
+  --status-backlog-bg: rgba(217, 119, 6, 0.1);
+  --status-completed: #0891b2;
+  --status-completed-bg: rgba(8, 145, 178, 0.1);
+  --status-canceled: #dc2626;
+  --status-canceled-bg: rgba(220, 38, 38, 0.08);
+
+  /* Priority colors */
+  --priority-urgent: #dc2626;
+  --priority-high: #ea580c;
+  --priority-normal: #7c3aed;
+  --priority-low: #6b7280;
+
+  /* Accent - terracotta/rust */
+  --accent: #c2410c;
+  --accent-hover: #9a3412;
+  --accent-bg: rgba(194, 65, 12, 0.1);
+
+  /* Borders */
+  --border: #e5e5e5;
+  --border-hover: #d4d4d4;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.07);
+  --shadow-lg: 0 10px 20px rgba(0, 0, 0, 0.1);
+
+  /* Font families */
+  --font-display: "Outfit", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  /* Sizing */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-display);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100%;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-hover);
+}
+
+/* Selection */
+::selection {
+  background: var(--accent-bg);
+  color: var(--text-primary);
+}
+
+/* Focus outline */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Utility animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out;
+}
+
+.animate-slide-in {
+  animation: slideIn 0.2s ease-out;
+}
+
+.animate-pulse {
+  animation: pulse 2s infinite;
+}
+
+/* Typography */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--font-mono);
+}
+
+/* Buttons base */
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+/* Input base */
+input,
+textarea {
+  font-family: inherit;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  color: var(--text-primary);
+  font-size: 14px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+input:hover,
+textarea:hover {
+  border-color: var(--border-hover);
+}
+
+input:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+}
+

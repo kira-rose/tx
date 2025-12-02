@@ -3,7 +3,8 @@
 // ============================================================================
 // Central export point for storage implementations and factory.
 
-export { IStorage, BaseStorage, StorageFactory } from "./interface.js";
+export type { IStorage, StorageFactory } from "./interface.js";
+export { BaseStorage } from "./interface.js";
 export { FileStorage } from "./file.js";
 export { SQLiteStorage } from "./sqlite.js";
 export { PostgresStorage } from "./postgres.js";
@@ -52,4 +53,5 @@ export function getStorageTypeName(config: StorageConfig): string {
       return "Unknown";
   }
 }
+
 

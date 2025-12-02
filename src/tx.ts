@@ -5,12 +5,9 @@
 // ============================================================================
 // Refactored to use the new storage interface and config system.
 
-import { ChatBedrockConverse } from "@langchain/aws";
-import { ChatOpenAI } from "@langchain/openai";
-import { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { createInterface } from "readline";
 import { randomUUID } from "crypto";
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
 // Import server
 import { startServerCLI } from "./server/index.js";
@@ -24,7 +21,6 @@ import {
   Scope,
   SemanticField,
   FieldDefinition,
-  LLMConfig,
   TxConfig,
   DEFAULT_SCHEMA,
 } from "./types/index.js";
@@ -32,6 +28,9 @@ import {
 // Import storage and config
 import { IStorage, createStorage, getStorageTypeName } from "./storage/index.js";
 import { loadConfig, saveConfig, getDataDir, describeConfig, getCurrentScope, setCurrentScope } from "./config/index.js";
+
+// Import semantic extraction
+import { extractSemantics, addFieldToSchema, createModel } from "./extraction/index.js";
 
 // ============================================================================
 // GLOBAL STATE
@@ -43,32 +42,6 @@ let config: TxConfig;
 // ============================================================================
 // UTILITIES
 // ============================================================================
-
-function createModel(llmConfig: LLMConfig): BaseChatModel {
-  switch (llmConfig.provider) {
-    case "bedrock":
-      return new ChatBedrockConverse({
-        model: llmConfig.bedrock?.model || "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        region: llmConfig.bedrock?.region || "us-east-1",
-      });
-    case "openai":
-      if (!llmConfig.openai) throw new Error("OpenAI config not found");
-      return new ChatOpenAI({
-        modelName: llmConfig.openai.model,
-        openAIApiKey: llmConfig.openai.apiKey,
-        configuration: { baseURL: llmConfig.openai.baseUrl },
-      });
-    case "local":
-      if (!llmConfig.local) throw new Error("Local config not found");
-      return new ChatOpenAI({
-        modelName: llmConfig.local.model,
-        openAIApiKey: llmConfig.local.apiKey || "not-needed",
-        configuration: { baseURL: llmConfig.local.baseUrl },
-      });
-    default:
-      throw new Error(`Unknown provider: ${llmConfig.provider}`);
-  }
-}
 
 function prompt(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -261,34 +234,6 @@ function isThisWeek(deadline: string): boolean {
 // SCHEMA OPERATIONS
 // ============================================================================
 
-function addFieldToSchema(
-  schema: TaskSchema,
-  fieldName: string,
-  definition: Partial<FieldDefinition>
-): boolean {
-  const normalizedName = fieldName.toLowerCase().replace(/\s+/g, "_");
-
-  if (schema.fields[normalizedName]) {
-    return false;
-  }
-
-  for (const [, existingDef] of Object.entries(schema.fields)) {
-    if (existingDef.aliases?.includes(normalizedName)) {
-      return false;
-    }
-  }
-
-  schema.fields[normalizedName] = {
-    type: definition.type || "string",
-    description: definition.description || `Auto-discovered field: ${normalizedName}`,
-    examples: definition.examples || [],
-    category: "custom",
-  };
-
-  schema.version++;
-  return true;
-}
-
 function resolveFieldName(schema: TaskSchema, fieldName: string): string {
   const normalized = fieldName.toLowerCase().replace(/\s+/g, "_");
 
@@ -379,231 +324,6 @@ function updateTemplates(index: TaskIndex, task: Task, templateId?: string) {
 }
 
 // ============================================================================
-// SEMANTIC EXTRACTION
-// ============================================================================
-
-function formatSchemaForPrompt(schema: TaskSchema): string {
-  const byCategory: Record<string, string[]> = {
-    core: [],
-    relationship: [],
-    recurrence: [],
-    custom: [],
-  };
-
-  for (const [name, def] of Object.entries(schema.fields)) {
-    const category = def.category || "custom";
-    const aliasStr = def.aliases?.length ? ` (aliases: ${def.aliases.join(", ")})` : "";
-    const enumStr = def.enum?.length ? ` [${def.enum.join("|")}]` : "";
-    const exampleStr = def.examples?.length ? ` e.g. ${def.examples.slice(0, 2).join(", ")}` : "";
-    byCategory[category].push(`- ${name} (${def.type})${aliasStr}${enumStr}: ${def.description}${exampleStr}`);
-  }
-
-  let result = "";
-  if (byCategory.core.length) {
-    result += "\nCORE FIELDS:\n" + byCategory.core.join("\n");
-  }
-  if (byCategory.relationship.length) {
-    result += "\n\nRELATIONSHIP FIELDS:\n" + byCategory.relationship.join("\n");
-  }
-  if (byCategory.recurrence.length) {
-    result += "\n\nRECURRENCE FIELDS:\n" + byCategory.recurrence.join("\n");
-  }
-  if (byCategory.custom.length) {
-    result += "\n\nCUSTOM FIELDS (learned from previous tasks):\n" + byCategory.custom.join("\n");
-  }
-
-  return result;
-}
-
-function getExtractionPrompt(schema: TaskSchema, index: TaskIndex): string {
-  const today = getToday();
-  const dayOfWeek = getDayOfWeek();
-
-  const schemaFields = formatSchemaForPrompt(schema);
-
-  const templateHints = Object.keys(index.templates).length > 0
-    ? `\n\nKNOWN TASK PATTERNS:\n${Object.values(index.templates)
-        .slice(0, 5)
-        .map((t) => `- ${t.name}: ${t.pattern}`)
-        .join("\n")}`
-    : "";
-
-  return `You are a semantic extraction engine for task management. Your job is to extract structured fields from natural language task descriptions.
-
-TODAY: ${dayOfWeek}, ${today}
-
-SCHEMA - USE THESE FIELD NAMES:
-${schemaFields}
-${templateHints}
-
-INSTRUCTIONS:
-1. Detect if the input contains MULTIPLE distinct tasks (separated by commas, "and", newlines, or listed)
-2. Detect SEQUENTIAL relationships: "and then", "then", "after that", "before", "first...then", "once...then"
-3. Extract values for fields defined in the schema above
-4. Use the EXACT field names from the schema (prefer canonical names over aliases)
-5. For deadlines - MUST use strict ISO 8601 format:
-   - Date only: YYYY-MM-DD (e.g., "tuesday" → "${parseRelativeDate("tuesday") || "2025-12-10"}")
-   - Date + time: YYYY-MM-DDTHH:MM in 24-hour format (e.g., "2pm today" → "${today}T14:00", "3:30pm tomorrow" → next day + "T15:30")
-   - NEVER return strings like "today", "2pm today", "tomorrow" - ALWAYS convert to actual ISO dates
-   - "today" = ${today}, "tomorrow" = tomorrow's ISO date
-   - Use 24-hour time: 2pm = 14:00, 9am = 09:00, 3:30pm = 15:30
-6. Normalize names to snake_case (e.g., "John Smith" → "john_smith")
-7. If you identify a meaningful field NOT in the schema, include it with a suggested type
-
-RESPOND WITH ONLY VALID JSON:
-
-For a SINGLE task:
-{
-  "tasks": [{
-    "raw": "original text for this task",
-    "fields": {
-      "fieldName": { "name": "fieldName", "value": "extracted value", "normalized": "canonical_form" }
-    },
-    "summary": "Brief one-line summary",
-    "recurrence": { "pattern": "weekly", "dayOfWeek": "monday" }
-  }],
-  "newFields": []
-}
-
-For MULTIPLE tasks with SEQUENCE (e.g., "do X and then Y"):
-{
-  "tasks": [
-    { "raw": "first task", "fields": {...}, "summary": "...", "seq": 0 },
-    { "raw": "second task", "fields": {...}, "summary": "...", "seq": 1, "dependsOn": 0 }
-  ],
-  "newFields": []
-}
-
-For MULTIPLE PARALLEL tasks (e.g., "do X, Y, and Z"):
-{
-  "tasks": [
-    { "raw": "task X", "fields": {...}, "summary": "..." },
-    { "raw": "task Y", "fields": {...}, "summary": "..." },
-    { "raw": "task Z", "fields": {...}, "summary": "..." }
-  ],
-  "newFields": []
-}
-
-IMPORTANT:
-- ALWAYS return a "tasks" array, even for a single task
-- Each task needs its own "raw", "fields", and "summary"
-- Use "seq" (sequence number) and "dependsOn" (index of prerequisite task) for sequential tasks
-- "and then", "then", "after" indicate the next task depends on the previous one
-- Shared context (like a deadline) should be copied to each relevant task
-- Only include "newFields" if you discover semantic information that doesn't fit existing schema fields
-- New fields should be genuinely useful categories, not one-off values
-- Use existing schema fields whenever possible`;
-}
-
-interface NewFieldProposal {
-  name: string;
-  type: string;
-  description: string;
-}
-
-interface ExtractedTask {
-  raw: string;
-  fields: Record<string, SemanticField>;
-  summary: string;
-  recurrence?: Task["recurrence"];
-  templateId?: string;
-  seq?: number;
-  dependsOn?: number;
-}
-
-interface ExtractionResult {
-  tasks: ExtractedTask[];
-  newFields?: NewFieldProposal[];
-}
-
-async function extractSemantics(
-  raw: string,
-  schema: TaskSchema,
-  index: TaskIndex
-): Promise<ExtractionResult> {
-  const model = createModel(config.llm);
-
-  const response = await model.invoke([
-    new SystemMessage(getExtractionPrompt(schema, index)),
-    new HumanMessage(raw),
-  ]);
-
-  const content = typeof response.content === "string"
-    ? response.content
-    : JSON.stringify(response.content);
-
-  const jsonMatch = content.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    return { 
-      tasks: [{ raw, fields: { action: { name: "action", value: raw } }, summary: raw }] 
-    };
-  }
-
-  try {
-    const parsed = JSON.parse(jsonMatch[0]);
-
-    function normalizeFieldValue(fieldName: string, field: SemanticField): SemanticField {
-      if (fieldName === "deadline" && typeof field.value === "string") {
-        return { ...field, value: normalizeDeadline(field.value as string) };
-      }
-      return field;
-    }
-
-    if (parsed.tasks && Array.isArray(parsed.tasks)) {
-      const tasks: ExtractedTask[] = parsed.tasks.map((t: Record<string, unknown>, idx: number) => {
-        const normalizedFields: Record<string, SemanticField> = {};
-        const fields = t.fields as Record<string, SemanticField> | undefined;
-        for (const [key, value] of Object.entries(fields || {})) {
-          const canonicalName = resolveFieldName(schema, key);
-          normalizedFields[canonicalName] = normalizeFieldValue(canonicalName, value as SemanticField);
-        }
-
-        return {
-          raw: (t.raw as string) || raw,
-          fields: Object.keys(normalizedFields).length > 0
-            ? normalizedFields
-            : { action: { name: "action", value: (t.raw as string) || raw } },
-          summary: (t.summary as string) || (t.raw as string) || raw,
-          recurrence: t.recurrence as Task["recurrence"],
-          templateId: t.suggestedTemplate as string | undefined,
-          seq: (t.seq as number) ?? idx,
-          dependsOn: t.dependsOn as number | undefined,
-        };
-      });
-
-      return {
-        tasks,
-        newFields: parsed.newFields as NewFieldProposal[],
-      };
-    }
-
-    const normalizedFields: Record<string, SemanticField> = {};
-    const fields = parsed.fields as Record<string, SemanticField> | undefined;
-    for (const [key, value] of Object.entries(fields || {})) {
-      const canonicalName = resolveFieldName(schema, key);
-      normalizedFields[canonicalName] = normalizeFieldValue(canonicalName, value as SemanticField);
-    }
-
-    return {
-      tasks: [{
-        raw,
-        fields: Object.keys(normalizedFields).length > 0
-          ? normalizedFields
-          : { action: { name: "action", value: raw } },
-        summary: (parsed.summary as string) || raw,
-        recurrence: parsed.recurrence as Task["recurrence"],
-        templateId: parsed.suggestedTemplate as string | undefined,
-      }],
-      newFields: parsed.newFields as NewFieldProposal[],
-    };
-  } catch {
-    return { 
-      tasks: [{ raw, fields: { action: { name: "action", value: raw } }, summary: raw }] 
-    };
-  }
-}
-
-// ============================================================================
 // NATURAL LANGUAGE QUERIES
 // ============================================================================
 
@@ -674,7 +394,7 @@ async function addTasks(raw: string, options: { blocks?: string } = {}): Promise
 
   console.log(`\x1b[90m⏳ Extracting semantic structure...\x1b[0m`);
 
-  const { tasks: extractedTasks, newFields } = await extractSemantics(raw, schema, index);
+  const { tasks: extractedTasks, newFields } = await extractSemantics(raw, schema, index, config.llm);
 
   let schemaUpdated = false;
   if (newFields && newFields.length > 0) {

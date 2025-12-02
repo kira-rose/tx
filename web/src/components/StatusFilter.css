@@ -1,0 +1,82 @@
+.status-filter {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.filter-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  transition: all 0.15s;
+}
+
+.filter-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.filter-btn.active {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.filter-btn.all.active {
+  background: var(--bg-active);
+}
+
+.filter-btn.active.active {
+  color: var(--status-active);
+  background: var(--status-active-bg);
+}
+
+.filter-btn.backlog.active {
+  color: var(--status-backlog);
+  background: var(--status-backlog-bg);
+}
+
+.filter-btn.completed.active {
+  color: var(--status-completed);
+  background: var(--status-completed-bg);
+}
+
+.filter-btn.canceled.active {
+  color: var(--status-canceled);
+  background: var(--status-canceled-bg);
+}
+
+.filter-icon {
+  font-size: 10px;
+}
+
+.filter-label {
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .status-filter {
+    flex: 1;
+    min-width: 0;
+    justify-content: center;
+  }
+
+  .filter-btn {
+    padding: 6px 8px;
+    flex: 1;
+    justify-content: center;
+  }
+
+  .filter-label {
+    display: none;
+  }
+}
+

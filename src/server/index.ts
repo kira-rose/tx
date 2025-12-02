@@ -65,7 +65,7 @@ export async function createServer(options: ServerOptions = {}): Promise<TxServe
     config,
   });
 
-  // Create HTTP server
+  // Create HTTP server with CORS handling
   const httpServer = createHTTPServer({
     router: appRouter,
     createContext,
@@ -74,9 +74,21 @@ export async function createServer(options: ServerOptions = {}): Promise<TxServe
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, trpc-batch-mode",
         },
       };
+    },
+    middleware: (req, res, next) => {
+      // Handle CORS preflight
+      if (req.method === "OPTIONS") {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, trpc-batch-mode");
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
+      next();
     },
   });
 

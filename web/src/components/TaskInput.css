@@ -1,0 +1,145 @@
+.task-input-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.input-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 4px 4px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  transition: all 0.2s;
+}
+
+.input-wrapper:hover {
+  border-color: var(--border-hover);
+}
+
+.input-wrapper:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+.input-prefix {
+  font-size: 20px;
+  font-weight: 300;
+  color: var(--accent);
+  user-select: none;
+}
+
+.task-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  padding: 14px 0;
+  font-size: 15px;
+  color: var(--text-primary);
+}
+
+.task-input:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.task-input::placeholder {
+  color: var(--text-muted);
+}
+
+.input-scope {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--accent-bg);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent);
+}
+
+.scope-icon {
+  font-size: 8px;
+}
+
+.submit-btn {
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  border-radius: var(--radius-md);
+  color: #fff;
+  font-size: 18px;
+  font-weight: 600;
+  transition: all 0.15s;
+}
+
+.submit-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+  transform: scale(1.02);
+}
+
+.submit-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.submit-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.submit-icon {
+  line-height: 1;
+}
+
+.submit-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.input-error {
+  font-size: 13px;
+  color: var(--status-canceled);
+  padding: 0 16px;
+}
+
+/* Responsive */
+@media (max-width: 640px) {
+  .input-wrapper {
+    padding: 4px 4px 4px 12px;
+  }
+
+  .input-prefix {
+    font-size: 16px;
+  }
+
+  .task-input {
+    padding: 12px 0;
+    font-size: 14px;
+  }
+
+  .task-input::placeholder {
+    font-size: 13px;
+  }
+
+  .input-scope {
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+
+  .submit-btn {
+    width: 40px;
+    height: 40px;
+    font-size: 16px;
+  }
+}
+

@@ -3,7 +3,7 @@
 // ============================================================================
 // Base tRPC configuration for the server.
 
-import { initTRPC, TRPCError } from "@trpc/server";
+import { initTRPC } from "@trpc/server";
 import { z } from "zod";
 import { IStorage } from "../storage/index.js";
 import { TxConfig } from "../types/index.js";
@@ -85,4 +85,5 @@ export const FieldDefinitionSchema = z.object({
   enum: z.array(z.string()).optional(),
   category: z.enum(["core", "relationship", "recurrence", "custom"]).optional(),
 });
+
 

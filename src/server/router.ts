@@ -21,11 +21,12 @@ import {
   Task,
   TaskIndex,
   TaskSchema,
-  TaskStatus,
   Scope,
   SemanticField,
   FieldDefinition,
 } from "../types/index.js";
+
+import { extractSemantics, addFieldToSchema } from "../extraction/index.js";
 
 // ============================================================================
 // TASK ROUTER
@@ -145,44 +146,103 @@ export const taskRouter = router({
     .input(CreateTaskInputSchema)
     .mutation(async ({ ctx, input }) => {
       const index = await ctx.storage.loadIndex();
+      const schema = await ctx.storage.loadSchema();
       
-      // For server-side creation, we create a basic task
-      // Full semantic extraction should be done client-side or via a separate endpoint
-      const task: Task = {
-        id: randomUUID(),
-        raw: input.raw,
-        created: new Date().toISOString(),
-        updated: new Date().toISOString(),
-        status: "backlog",
-        completed: false,
-        fields: {
-          summary: { name: "summary", value: input.raw },
-          action: { name: "action", value: input.raw },
-        },
-      };
+      // Perform semantic extraction using LLM
+      const { tasks: extractedTasks, newFields } = await extractSemantics(
+        input.raw,
+        schema,
+        index,
+        ctx.config.llm
+      );
 
-      // Handle blocking relationship
-      if (input.blocks) {
-        const blockedTask = await ctx.storage.findTaskByPrefix(input.blocks);
-        if (blockedTask) {
-          task.blocks = [blockedTask.id];
-          blockedTask.blockedBy = blockedTask.blockedBy || [];
-          blockedTask.blockedBy.push(task.id);
-          await ctx.storage.saveTask(blockedTask);
+      // Handle new schema fields
+      if (newFields && newFields.length > 0) {
+        let schemaUpdated = false;
+        for (const proposal of newFields) {
+          const added = addFieldToSchema(schema, proposal.name, {
+            type: proposal.type as FieldDefinition["type"],
+            description: proposal.description,
+          });
+          if (added) schemaUpdated = true;
+        }
+        if (schemaUpdated) {
+          await ctx.storage.saveSchema(schema);
         }
       }
 
-      await ctx.storage.saveTask(task);
-      
-      // Update index
-      index.tasks.push(task.id);
-      index.stats.totalCreated++;
-      if (index.stats.byStatus) {
-        index.stats.byStatus.backlog++;
+      // Create tasks from extracted data
+      const createdTasks: Task[] = [];
+      const taskIdMap: Record<number, string> = {};
+
+      for (const extracted of extractedTasks) {
+        const task: Task = {
+          id: randomUUID(),
+          raw: extracted.raw,
+          created: new Date().toISOString(),
+          updated: new Date().toISOString(),
+          status: "backlog",
+          completed: false,
+          fields: {
+            ...extracted.fields,
+            summary: extracted.fields.summary || { name: "summary", value: extracted.summary },
+          },
+          recurrence: extracted.recurrence,
+          templateId: extracted.templateId,
+        };
+
+        // Track for dependency resolution
+        if (extracted.seq !== undefined) {
+          taskIdMap[extracted.seq] = task.id;
+        }
+
+        // Handle blocking relationship from input
+        if (input.blocks && createdTasks.length === 0) {
+          const blockedTask = await ctx.storage.findTaskByPrefix(input.blocks);
+          if (blockedTask) {
+            task.blocks = [blockedTask.id];
+            blockedTask.blockedBy = blockedTask.blockedBy || [];
+            blockedTask.blockedBy.push(task.id);
+            await ctx.storage.saveTask(blockedTask);
+          }
+        }
+
+        await ctx.storage.saveTask(task);
+        createdTasks.push(task);
+
+        // Update index
+        index.tasks.push(task.id);
+        index.stats.totalCreated++;
+        if (index.stats.byStatus) {
+          index.stats.byStatus.backlog++;
+        }
       }
+
+      // Handle sequential dependencies between created tasks
+      for (let i = 0; i < extractedTasks.length; i++) {
+        const extracted = extractedTasks[i];
+        if (extracted.dependsOn !== undefined && taskIdMap[extracted.dependsOn]) {
+          const task = createdTasks[i];
+          const dependsOnId = taskIdMap[extracted.dependsOn];
+          
+          task.blockedBy = task.blockedBy || [];
+          task.blockedBy.push(dependsOnId);
+          
+          const prerequisite = createdTasks.find(t => t.id === dependsOnId);
+          if (prerequisite) {
+            prerequisite.blocks = prerequisite.blocks || [];
+            prerequisite.blocks.push(task.id);
+            await ctx.storage.saveTask(prerequisite);
+          }
+          
+          await ctx.storage.saveTask(task);
+        }
+      }
+
       await ctx.storage.saveIndex(index);
 
-      return task;
+      // Return first task (or all if multiple)
+      return createdTasks.length === 1 ? createdTasks[0] : createdTasks[0];
     }),
 
   /**

@@ -9,7 +9,6 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
-  readdirSync,
   unlinkSync,
 } from "fs";
 import { join } from "path";
@@ -19,7 +18,6 @@ import {
   Task,
   TaskIndex,
   TaskSchema,
-  TaskStatus,
   FileStorageConfig,
   DEFAULT_SCHEMA,
   DEFAULT_INDEX,
