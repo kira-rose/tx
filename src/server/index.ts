@@ -12,7 +12,7 @@ import { appRouter, AppRouter } from "./router.js";
 import { TRPCContext } from "./trpc.js";
 import { IStorage, createStorage } from "../storage/index.js";
 import { TxConfig } from "../types/index.js";
-import { loadConfig } from "../config/index.js";
+import { loadConfigWithEnv } from "../config/index.js";
 
 export { appRouter, AppRouter } from "./router.js";
 export { TRPCContext } from "./trpc.js";
@@ -47,7 +47,7 @@ export interface TxServer {
 }
 
 export async function createServer(options: ServerOptions = {}): Promise<TxServer> {
-  const config = options.config || loadConfig();
+  const config = options.config || loadConfigWithEnv();
   const opts = {
     port: options.port ?? DEFAULT_OPTIONS.port,
     host: options.host ?? DEFAULT_OPTIONS.host,
@@ -88,6 +88,20 @@ export async function createServer(options: ServerOptions = {}): Promise<TxServe
         res.end();
         return;
       }
+      
+      // Health check endpoint for Docker/K8s
+      if (req.url === "/health" && req.method === "GET") {
+        res.setHeader("Content-Type", "application/json");
+        res.statusCode = 200;
+        res.end(JSON.stringify({ 
+          status: "ok", 
+          timestamp: new Date().toISOString(),
+          storage: config.storage.type,
+          llm: config.llm.provider,
+        }));
+        return;
+      }
+      
       next();
     },
   });

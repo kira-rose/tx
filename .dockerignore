@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+web/node_modules/
+
+# Build output (we build in Docker)
+dist/
+web/dist/
+
+# Development files
+.git/
+.gitignore
+.vscode/
+.idea/
+*.md
+!README.md
+
+# Docker files (not needed in context)
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Local config and data
+.tx/
+.env
+.env.*
+!.env.example
+
+# Test files
+*.test.ts
+*.spec.ts
+__tests__/
+coverage/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor files
+*.swp
+*.swo
+*~
+

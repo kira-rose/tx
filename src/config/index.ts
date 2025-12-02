@@ -281,6 +281,82 @@ export function updateLLMConfig(config: TxConfig, llm: Partial<LLMConfig>): TxCo
   };
 }
 
+// ---- Environment Variable Loading ----
+
+/**
+ * Load configuration from environment variables (for Docker/containerized deployments)
+ * Environment variables take precedence over file config
+ */
+export function loadConfigFromEnv(): TxConfig | null {
+  const storageType = process.env.TX_STORAGE_TYPE;
+  
+  // Only use env config if storage type is specified
+  if (!storageType) {
+    return null;
+  }
+
+  let storage: StorageConfig;
+  
+  switch (storageType) {
+    case "postgres":
+      storage = {
+        type: "postgres",
+        host: process.env.TX_POSTGRES_HOST || "localhost",
+        port: parseInt(process.env.TX_POSTGRES_PORT || "5432", 10),
+        database: process.env.TX_POSTGRES_DATABASE || "tx",
+        user: process.env.TX_POSTGRES_USER || "tx",
+        password: process.env.TX_POSTGRES_PASSWORD || "",
+        ssl: process.env.TX_POSTGRES_SSL === "true",
+      };
+      break;
+    case "sqlite":
+      storage = {
+        type: "sqlite",
+        path: process.env.TX_SQLITE_PATH || join(TX_DATA_DIR, "tx.db"),
+      };
+      break;
+    case "file":
+    default:
+      storage = {
+        type: "file",
+        basePath: process.env.TX_FILE_PATH || TX_DATA_DIR,
+      };
+      break;
+  }
+
+  const llm: LLMConfig = {
+    provider: (process.env.TX_LLM_PROVIDER || "bedrock") as "bedrock" | "openai" | "local",
+    bedrock: {
+      model: process.env.TX_LLM_MODEL,
+      region: process.env.AWS_REGION,
+    },
+    openai: process.env.OPENAI_API_KEY ? {
+      apiKey: process.env.OPENAI_API_KEY,
+      baseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+      model: process.env.TX_LLM_MODEL || "gpt-4o-mini",
+    } : undefined,
+  };
+
+  return {
+    llm,
+    storage,
+    currentScope: process.env.TX_CURRENT_SCOPE,
+  };
+}
+
+/**
+ * Load configuration with environment variable override
+ * Tries env vars first, falls back to file config
+ */
+export function loadConfigWithEnv(): TxConfig {
+  const envConfig = loadConfigFromEnv();
+  if (envConfig) {
+    console.log(`\x1b[33mLoading config from environment variables\x1b[0m`);
+    return envConfig;
+  }
+  return loadConfig();
+}
+
 // ---- Display Helpers ----
 
 /**
