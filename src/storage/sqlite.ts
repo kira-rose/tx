@@ -15,6 +15,9 @@ import {
   SQLiteStorageConfig,
   DEFAULT_SCHEMA,
   DEFAULT_INDEX,
+  Note,
+  NoteIndex,
+  DEFAULT_NOTE_INDEX,
 } from "../types/index.js";
 
 // Note: This implementation uses better-sqlite3 for synchronous operations.
@@ -95,6 +98,28 @@ export class SQLiteStorage extends BaseStorage {
 
       CREATE INDEX IF NOT EXISTS idx_task_fields_name ON task_fields(field_name);
       CREATE INDEX IF NOT EXISTS idx_task_fields_value ON task_fields(field_value);
+
+      -- Notes table
+      CREATE TABLE IF NOT EXISTS notes (
+        id TEXT PRIMARY KEY,
+        raw TEXT NOT NULL,
+        title TEXT,
+        created TEXT NOT NULL,
+        updated TEXT NOT NULL,
+        fields TEXT NOT NULL,
+        tags TEXT NOT NULL,
+        related_tasks TEXT,
+        related_notes TEXT,
+        source TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created);
+
+      -- Note index
+      CREATE TABLE IF NOT EXISTS note_index (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        data TEXT NOT NULL
+      );
     `);
 
     // Initialize index if not exists
@@ -110,6 +135,14 @@ export class SQLiteStorage extends BaseStorage {
     if (!schemaExists) {
       this.db.prepare("INSERT INTO schema (id, data) VALUES (1, ?)").run(
         JSON.stringify({ ...DEFAULT_SCHEMA, lastUpdated: new Date().toISOString() })
+      );
+    }
+
+    // Initialize note index if not exists
+    const noteIndexExists = this.db.prepare("SELECT 1 FROM note_index WHERE id = 1").get();
+    if (!noteIndexExists) {
+      this.db.prepare("INSERT INTO note_index (id, data) VALUES (1, ?)").run(
+        JSON.stringify(DEFAULT_NOTE_INDEX)
       );
     }
   }
@@ -492,6 +525,103 @@ export class SQLiteStorage extends BaseStorage {
       end: end.toISOString().split("T")[0],
     };
   }
+
+  // ---- Note Operations ----
+
+  async saveNote(note: Note): Promise<void> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO notes (
+        id, raw, title, created, updated, fields, tags,
+        related_tasks, related_notes, source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(
+      note.id,
+      note.raw,
+      note.title || null,
+      note.created,
+      note.updated,
+      JSON.stringify(note.fields),
+      JSON.stringify(note.tags),
+      note.relatedTasks ? JSON.stringify(note.relatedTasks) : null,
+      note.relatedNotes ? JSON.stringify(note.relatedNotes) : null,
+      note.source || null
+    );
+  }
+
+  async loadNote(id: string): Promise<Note | null> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const row = this.db.prepare("SELECT * FROM notes WHERE id = ?").get(id) as NoteRow | undefined;
+    if (!row) return null;
+
+    return this.noteFromRow(row);
+  }
+
+  async deleteNote(id: string): Promise<boolean> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const result = this.db.prepare("DELETE FROM notes WHERE id = ?").run(id);
+    if (result.changes > 0) {
+      // Update index
+      const index = await this.loadNoteIndex();
+      index.notes = index.notes.filter((nid) => nid !== id);
+      await this.saveNoteIndex(index);
+      return true;
+    }
+    return false;
+  }
+
+  async loadAllNotes(): Promise<Note[]> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const rows = this.db.prepare("SELECT * FROM notes ORDER BY created DESC").all() as NoteRow[];
+    return rows.map((row) => this.noteFromRow(row));
+  }
+
+  async loadNoteIndex(): Promise<NoteIndex> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const row = this.db.prepare("SELECT data FROM note_index WHERE id = 1").get() as { data: string } | undefined;
+    if (!row) return { ...DEFAULT_NOTE_INDEX };
+
+    try {
+      return JSON.parse(row.data);
+    } catch {
+      return { ...DEFAULT_NOTE_INDEX };
+    }
+  }
+
+  async saveNoteIndex(index: NoteIndex): Promise<void> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    this.db.prepare("UPDATE note_index SET data = ? WHERE id = 1").run(JSON.stringify(index));
+  }
+
+  async getAllNoteIds(): Promise<string[]> {
+    if (!this.db) throw new Error("Database not initialized");
+
+    const rows = this.db.prepare("SELECT id FROM notes").all() as { id: string }[];
+    return rows.map((row) => row.id);
+  }
+
+  private noteFromRow(row: NoteRow): Note {
+    return {
+      id: row.id,
+      raw: row.raw,
+      title: row.title || undefined,
+      created: row.created,
+      updated: row.updated,
+      fields: JSON.parse(row.fields),
+      tags: JSON.parse(row.tags),
+      relatedTasks: row.related_tasks ? JSON.parse(row.related_tasks) : undefined,
+      relatedNotes: row.related_notes ? JSON.parse(row.related_notes) : undefined,
+      source: row.source || undefined,
+    };
+  }
 }
 
 // Type for database rows
@@ -510,5 +640,18 @@ interface TaskRow {
   recurrence: string | null;
   template_id: string | null;
   archived: number;
+}
+
+interface NoteRow {
+  id: string;
+  raw: string;
+  title: string | null;
+  created: string;
+  updated: string;
+  fields: string;
+  tags: string;
+  related_tasks: string | null;
+  related_notes: string | null;
+  source: string | null;
 }
 

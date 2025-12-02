@@ -13,6 +13,10 @@ import {
   TaskQueryResult,
   TaskStatus,
   StorageConfig,
+  Note,
+  NoteIndex,
+  NoteQuery,
+  NoteQueryResult,
 } from "../types/index.js";
 
 /**
@@ -141,6 +145,53 @@ export interface IStorage {
     index: TaskIndex;
     schema: TaskSchema;
   }): Promise<void>;
+
+  // ---- Note Operations ----
+
+  /**
+   * Save a note (create or update)
+   */
+  saveNote(note: Note): Promise<void>;
+
+  /**
+   * Load a note by its full ID
+   */
+  loadNote(id: string): Promise<Note | null>;
+
+  /**
+   * Find a note by ID prefix
+   */
+  findNoteByPrefix(prefix: string): Promise<Note | null>;
+
+  /**
+   * Delete a note permanently
+   */
+  deleteNote(id: string): Promise<boolean>;
+
+  /**
+   * Load all notes
+   */
+  loadAllNotes(): Promise<Note[]>;
+
+  /**
+   * Query notes with filters
+   */
+  queryNotes(query: NoteQuery): Promise<NoteQueryResult>;
+
+  /**
+   * Load the note index
+   */
+  loadNoteIndex(): Promise<NoteIndex>;
+
+  /**
+   * Save the note index
+   */
+  saveNoteIndex(index: NoteIndex): Promise<void>;
+
+  /**
+   * Get all note IDs
+   */
+  getAllNoteIds(): Promise<string[]>;
 }
 
 /**
@@ -173,6 +224,14 @@ export abstract class BaseStorage implements IStorage {
   abstract loadSchema(): Promise<TaskSchema>;
   abstract saveSchema(schema: TaskSchema): Promise<void>;
   abstract getAllTaskIds(): Promise<string[]>;
+  // Note abstract methods
+  abstract saveNote(note: Note): Promise<void>;
+  abstract loadNote(id: string): Promise<Note | null>;
+  abstract deleteNote(id: string): Promise<boolean>;
+  abstract loadAllNotes(): Promise<Note[]>;
+  abstract loadNoteIndex(): Promise<NoteIndex>;
+  abstract saveNoteIndex(index: NoteIndex): Promise<void>;
+  abstract getAllNoteIds(): Promise<string[]>;
 
   /**
    * Default implementation of findTaskByPrefix using getAllTaskIds
@@ -308,6 +367,108 @@ export abstract class BaseStorage implements IStorage {
     
     // Save index
     await this.saveIndex(data.index);
+  }
+
+  // ---- Note Default Implementations ----
+
+  /**
+   * Default implementation of findNoteByPrefix
+   */
+  async findNoteByPrefix(prefix: string): Promise<Note | null> {
+    const allIds = await this.getAllNoteIds();
+    const matches = allIds.filter((id) => id.startsWith(prefix));
+    
+    if (matches.length === 1) {
+      return this.loadNote(matches[0]);
+    }
+    
+    return null;
+  }
+
+  /**
+   * Default implementation of queryNotes
+   */
+  async queryNotes(query: NoteQuery): Promise<NoteQueryResult> {
+    let notes = await this.loadAllNotes();
+    
+    // Apply tag filter
+    if (query.tags?.length) {
+      notes = notes.filter((note) =>
+        query.tags!.some((tag) => note.tags.includes(tag))
+      );
+    }
+    
+    // Apply search
+    if (query.search) {
+      const searchLower = query.search.toLowerCase();
+      notes = notes.filter(
+        (note) =>
+          note.raw.toLowerCase().includes(searchLower) ||
+          note.title?.toLowerCase().includes(searchLower) ||
+          note.tags.some((t) => t.toLowerCase().includes(searchLower))
+      );
+    }
+    
+    // Apply related to task filter
+    if (query.relatedToTask) {
+      notes = notes.filter((note) =>
+        note.relatedTasks?.includes(query.relatedToTask!)
+      );
+    }
+    
+    // Apply related to note filter
+    if (query.relatedToNote) {
+      notes = notes.filter((note) =>
+        note.relatedNotes?.includes(query.relatedToNote!)
+      );
+    }
+    
+    // Apply custom filters
+    if (query.filters?.length) {
+      notes = this.applyNoteFilters(notes, query.filters);
+    }
+    
+    const total = notes.length;
+    
+    // Apply pagination
+    if (query.offset !== undefined) {
+      notes = notes.slice(query.offset);
+    }
+    if (query.limit !== undefined) {
+      notes = notes.slice(0, query.limit);
+    }
+    
+    return { notes, total };
+  }
+
+  protected applyNoteFilters(notes: Note[], filters: NoteQuery["filters"]): Note[] {
+    if (!filters) return notes;
+    
+    return notes.filter((note) => {
+      return filters.every((filter) => {
+        const field = note.fields[filter.field];
+        if (!field) return filter.op === "not_exists";
+        if (filter.op === "exists") return true;
+        
+        const fieldValue = String(field.normalized || field.value).toLowerCase();
+        const queryValue = filter.value.toLowerCase();
+        
+        switch (filter.op) {
+          case "eq":
+            return fieldValue === queryValue;
+          case "contains":
+            return fieldValue.includes(queryValue);
+          case "startswith":
+            return fieldValue.startsWith(queryValue);
+          case "gt":
+            return fieldValue > queryValue;
+          case "lt":
+            return fieldValue < queryValue;
+          default:
+            return fieldValue === queryValue;
+        }
+      });
+    });
   }
 
   // ---- Protected Helper Methods ----

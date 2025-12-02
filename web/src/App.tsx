@@ -7,9 +7,10 @@ import { ScopeSelector } from "./components/ScopeSelector";
 import { Stats } from "./components/Stats";
 import { FilterPanel, FilterState } from "./components/FilterPanel";
 import { SemanticExplorer } from "./components/SemanticExplorer";
+import { NotesView } from "./components/NotesView";
 import "./App.css";
 
-type MainView = "tasks" | "explorer";
+type MainView = "tasks" | "notes" | "explorer";
 type StatusFilterType = "active" | "backlog" | "all" | "completed" | "canceled";
 
 export default function App() {
@@ -60,16 +61,26 @@ export default function App() {
           <button
             className={`nav-btn ${mainView === "tasks" ? "active" : ""}`}
             onClick={() => setMainView("tasks")}
+            title="Tasks"
           >
             <span className="nav-icon">☰</span>
-            <span>Tasks</span>
+            <span className="nav-label">Tasks</span>
+          </button>
+          <button
+            className={`nav-btn ${mainView === "notes" ? "active" : ""}`}
+            onClick={() => setMainView("notes")}
+            title="Notes"
+          >
+            <span className="nav-icon">✎</span>
+            <span className="nav-label">Notes</span>
           </button>
           <button
             className={`nav-btn ${mainView === "explorer" ? "active" : ""}`}
             onClick={() => setMainView("explorer")}
+            title="Explorer"
           >
             <span className="nav-icon">◈</span>
-            <span>Explorer</span>
+            <span className="nav-label">Explorer</span>
           </button>
         </nav>
 
@@ -80,7 +91,7 @@ export default function App() {
 
       {/* Main content */}
       <main className="main">
-        {mainView === "tasks" ? (
+        {mainView === "tasks" && (
           <>
             {/* Task input with filter toggle */}
             <section className="input-section">
@@ -113,7 +124,15 @@ export default function App() {
               <TaskList statusFilter={statusFilter} scope={currentScope} filters={filters} />
             </section>
           </>
-        ) : (
+        )}
+
+        {mainView === "notes" && (
+          <section className="notes-section">
+            <NotesView />
+          </section>
+        )}
+
+        {mainView === "explorer" && (
           <section className="explorer-section">
             <SemanticExplorer />
           </section>

@@ -463,3 +463,107 @@ export interface UpdateTaskInput {
   blockedBy?: string[];
 }
 
+// ============================================================================
+// NOTE TYPES
+// ============================================================================
+
+/**
+ * A Note is a piece of information that can be tagged and linked.
+ * Unlike tasks, notes don't have status or completion - they're reference material.
+ */
+export interface Note {
+  id: string;
+  raw: string; // The note content
+  title?: string; // Optional title extracted from content
+  created: string;
+  updated: string;
+  // Semantic fields extracted from the content
+  fields: Record<string, SemanticField>;
+  // Tags discovered through semantic analysis
+  tags: string[];
+  // Relationships
+  relatedTasks?: string[]; // Task IDs this note relates to
+  relatedNotes?: string[]; // Note IDs this note links to
+  // Source information
+  source?: string; // Where this note came from (manual, import, etc.)
+}
+
+export interface NoteIndex {
+  notes: string[];
+  // Tag statistics
+  tagStats: Record<string, number>; // tag -> count
+  // Entity relationships (discovered entities -> related items)
+  entities: Record<string, EntityInfo>;
+  // Total stats
+  stats: {
+    totalCreated: number;
+    byTag: Record<string, number>;
+    bySource: Record<string, number>;
+  };
+}
+
+export interface EntityInfo {
+  name: string;
+  type: "person" | "project" | "concept" | "location" | "organization" | "other";
+  occurrences: number;
+  relatedTaskIds: string[];
+  relatedNoteIds: string[];
+}
+
+export const DEFAULT_NOTE_INDEX: NoteIndex = {
+  notes: [],
+  tagStats: {},
+  entities: {},
+  stats: {
+    totalCreated: 0,
+    byTag: {},
+    bySource: {},
+  },
+};
+
+// ---- Note Query Types ----
+
+export interface NoteFilter {
+  field: string;
+  op: "eq" | "contains" | "gt" | "lt" | "exists" | "not_exists" | "startswith";
+  value: string;
+}
+
+export interface NoteQuery {
+  filters?: NoteFilter[];
+  tags?: string[]; // Filter by tags
+  search?: string; // Full-text search
+  relatedToTask?: string; // Notes related to a task
+  relatedToNote?: string; // Notes related to another note
+  limit?: number;
+  offset?: number;
+}
+
+export interface NoteQueryResult {
+  notes: Note[];
+  total: number;
+}
+
+// ---- Note API Types ----
+
+export interface CreateNoteInput {
+  raw: string;
+  source?: string;
+  relatedTasks?: string[];
+}
+
+export interface CreateNoteResult {
+  note: Note;
+  discoveredEntities: EntityInfo[];
+  linkedTasks: string[];
+}
+
+export interface UpdateNoteInput {
+  noteId: string;
+  raw?: string;
+  fields?: Record<string, SemanticField>;
+  tags?: string[];
+  relatedTasks?: string[];
+  relatedNotes?: string[];
+}
+

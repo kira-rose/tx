@@ -21,6 +21,9 @@ import {
   FileStorageConfig,
   DEFAULT_SCHEMA,
   DEFAULT_INDEX,
+  Note,
+  NoteIndex,
+  DEFAULT_NOTE_INDEX,
 } from "../types/index.js";
 
 export class FileStorage extends BaseStorage {
@@ -29,6 +32,9 @@ export class FileStorage extends BaseStorage {
   private archiveDir: string;
   private indexPath: string;
   private schemaPath: string;
+  // Note storage paths
+  private notesDir: string;
+  private noteIndexPath: string;
   private initialized: boolean = false;
 
   constructor(config: FileStorageConfig) {
@@ -38,11 +44,14 @@ export class FileStorage extends BaseStorage {
     this.archiveDir = join(this.tasksDir, "archive");
     this.indexPath = join(this.tasksDir, "index.json");
     this.schemaPath = join(this.tasksDir, "schema.json");
+    // Note paths
+    this.notesDir = join(this.basePath, "notes");
+    this.noteIndexPath = join(this.notesDir, "index.json");
   }
 
   async initialize(): Promise<void> {
     // Create directories if they don't exist
-    for (const dir of [this.basePath, this.tasksDir, this.archiveDir]) {
+    for (const dir of [this.basePath, this.tasksDir, this.archiveDir, this.notesDir]) {
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
       }
@@ -239,6 +248,94 @@ export class FileStorage extends BaseStorage {
     await this.ensureInitialized();
     schema.lastUpdated = new Date().toISOString();
     writeFileSync(this.schemaPath, JSON.stringify(schema, null, 2));
+  }
+
+  // ---- Note Operations ----
+
+  async saveNote(note: Note): Promise<void> {
+    await this.ensureInitialized();
+    const notePath = join(this.notesDir, `${note.id}.json`);
+    writeFileSync(notePath, JSON.stringify(note, null, 2));
+  }
+
+  async loadNote(id: string): Promise<Note | null> {
+    await this.ensureInitialized();
+    const notePath = join(this.notesDir, `${id}.json`);
+    
+    if (existsSync(notePath)) {
+      try {
+        return JSON.parse(readFileSync(notePath, "utf-8")) as Note;
+      } catch {
+        return null;
+      }
+    }
+    
+    return null;
+  }
+
+  async deleteNote(id: string): Promise<boolean> {
+    await this.ensureInitialized();
+    const notePath = join(this.notesDir, `${id}.json`);
+    
+    if (existsSync(notePath)) {
+      unlinkSync(notePath);
+      // Remove from index
+      const index = await this.loadNoteIndex();
+      index.notes = index.notes.filter((nid) => nid !== id);
+      await this.saveNoteIndex(index);
+      return true;
+    }
+    
+    return false;
+  }
+
+  async loadAllNotes(): Promise<Note[]> {
+    await this.ensureInitialized();
+    const index = await this.loadNoteIndex();
+    const notes: Note[] = [];
+    
+    for (const id of index.notes) {
+      const note = await this.loadNote(id);
+      if (note) {
+        notes.push(note);
+      }
+    }
+    
+    return notes;
+  }
+
+  async loadNoteIndex(): Promise<NoteIndex> {
+    await this.ensureInitialized();
+    
+    if (!existsSync(this.noteIndexPath)) {
+      return { ...DEFAULT_NOTE_INDEX };
+    }
+    
+    try {
+      const loaded = JSON.parse(readFileSync(this.noteIndexPath, "utf-8"));
+      return {
+        notes: loaded.notes || [],
+        tagStats: loaded.tagStats || {},
+        entities: loaded.entities || {},
+        stats: {
+          totalCreated: loaded.stats?.totalCreated || 0,
+          byTag: loaded.stats?.byTag || {},
+          bySource: loaded.stats?.bySource || {},
+        },
+      };
+    } catch {
+      return { ...DEFAULT_NOTE_INDEX };
+    }
+  }
+
+  async saveNoteIndex(index: NoteIndex): Promise<void> {
+    await this.ensureInitialized();
+    writeFileSync(this.noteIndexPath, JSON.stringify(index, null, 2));
+  }
+
+  async getAllNoteIds(): Promise<string[]> {
+    const index = await this.loadNoteIndex();
+    return index.notes;
   }
 
   // ---- Private Helpers ----

@@ -1590,6 +1590,251 @@ async function interactiveReview() {
 }
 
 // ============================================================================
+// NOTE FUNCTIONS
+// ============================================================================
+
+import { extractNoteSemantics, updateNoteIndex } from "./extraction/index.js";
+import { Note, NoteIndex, EntityInfo } from "./types/index.js";
+
+async function addNote(raw: string, linkTaskId?: string) {
+  if (!raw.trim()) {
+    console.log("\x1b[31m✗ Note content required\x1b[0m");
+    return;
+  }
+
+  const noteId = randomUUID();
+  const now = new Date().toISOString();
+
+  // Load indexes
+  const noteIndex = await storage.loadNoteIndex();
+  const taskIndex = await storage.loadIndex();
+
+  console.log("\n\x1b[36m◈ Analyzing note...\x1b[0m");
+
+  // Extract semantic information
+  const extractionResult = await extractNoteSemantics(
+    raw,
+    config.llm,
+    noteIndex,
+    taskIndex
+  );
+
+  // Create the note
+  const note: Note = {
+    id: noteId,
+    raw,
+    title: extractionResult.title,
+    created: now,
+    updated: now,
+    fields: extractionResult.fields,
+    tags: extractionResult.tags,
+    relatedTasks: linkTaskId ? [linkTaskId] : extractionResult.relatedTaskIds,
+    relatedNotes: [],
+    source: "cli",
+  };
+
+  // Save the note
+  await storage.saveNote(note);
+
+  // Update the note index
+  updateNoteIndex(noteIndex, noteId, extractionResult);
+  await storage.saveNoteIndex(noteIndex);
+
+  console.log(`\x1b[32m✓ Note created:\x1b[0m ${noteId.slice(0, 8)}`);
+  if (note.title) {
+    console.log(`  \x1b[1m${note.title}\x1b[0m`);
+  }
+  if (note.tags.length > 0) {
+    console.log(`  Tags: \x1b[33m${note.tags.join(", ")}\x1b[0m`);
+  }
+  if (extractionResult.entities.length > 0) {
+    console.log(`  Entities: ${extractionResult.entities.map(e => e.name).join(", ")}`);
+  }
+}
+
+async function listNotes() {
+  const result = await storage.queryNotes({ limit: 50 });
+
+  if (result.notes.length === 0) {
+    console.log("\n\x1b[33mNo notes found.\x1b[0m Use \x1b[1m--note \"your note\"\x1b[0m to create one.");
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ Notes (${result.total}) ─────────────────────────────────┐\x1b[0m\n`);
+
+  for (const note of result.notes) {
+    displayNote(note);
+  }
+}
+
+function displayNote(note: Note) {
+  const title = note.title || note.raw.substring(0, 50);
+  const id = note.id.slice(0, 6);
+  const tags = note.tags.length > 0 ? `\x1b[33m[${note.tags.join(", ")}]\x1b[0m` : "";
+
+  console.log(`  \x1b[90m${id}\x1b[0m  ${title} ${tags}`);
+  
+  if (note.relatedTasks && note.relatedTasks.length > 0) {
+    console.log(`        \x1b[90m→ ${note.relatedTasks.length} linked task(s)\x1b[0m`);
+  }
+}
+
+async function searchNotes(query: string) {
+  const result = await storage.queryNotes({ search: query });
+
+  if (result.notes.length === 0) {
+    console.log(`\n\x1b[33mNo notes matching "${query}"\x1b[0m`);
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ Search Results (${result.total}) ────────────────────────┐\x1b[0m\n`);
+
+  for (const note of result.notes) {
+    displayNote(note);
+  }
+}
+
+async function listNotesByTag(tag: string) {
+  const result = await storage.queryNotes({ tags: [tag] });
+
+  if (result.notes.length === 0) {
+    console.log(`\n\x1b[33mNo notes with tag "${tag}"\x1b[0m`);
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ Notes tagged: ${tag} (${result.total}) ────────────────────┐\x1b[0m\n`);
+
+  for (const note of result.notes) {
+    displayNote(note);
+  }
+}
+
+async function showNoteTags() {
+  const index = await storage.loadNoteIndex();
+  const tags = Object.entries(index.tagStats)
+    .sort(([, a], [, b]) => b - a);
+
+  if (tags.length === 0) {
+    console.log("\n\x1b[33mNo tags discovered yet.\x1b[0m");
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ Note Tags ────────────────────────────────────────┐\x1b[0m\n`);
+
+  for (const [tag, count] of tags) {
+    const bar = "█".repeat(Math.min(count, 20));
+    console.log(`  \x1b[33m${tag.padEnd(20)}\x1b[0m ${bar} ${count}`);
+  }
+}
+
+async function showNoteEntities() {
+  const index = await storage.loadNoteIndex();
+  const entities = Object.values(index.entities)
+    .sort((a, b) => b.occurrences - a.occurrences);
+
+  if (entities.length === 0) {
+    console.log("\n\x1b[33mNo entities discovered yet.\x1b[0m");
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ Discovered Entities ──────────────────────────────┐\x1b[0m\n`);
+
+  const byType: Record<string, EntityInfo[]> = {};
+  for (const entity of entities) {
+    if (!byType[entity.type]) byType[entity.type] = [];
+    byType[entity.type].push(entity);
+  }
+
+  for (const [type, typeEntities] of Object.entries(byType)) {
+    console.log(`  \x1b[1m${type.toUpperCase()}\x1b[0m`);
+    for (const entity of typeEntities.slice(0, 10)) {
+      const links = entity.relatedNoteIds.length + entity.relatedTaskIds.length;
+      console.log(`    ${entity.name} \x1b[90m(${entity.occurrences} mentions, ${links} links)\x1b[0m`);
+    }
+    console.log();
+  }
+}
+
+async function viewNote(id: string) {
+  let note = await storage.loadNote(id);
+  if (!note) {
+    note = await storage.findNoteByPrefix(id);
+  }
+
+  if (!note) {
+    console.log(`\n\x1b[31m✗ Note not found: ${id}\x1b[0m`);
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ Note: ${note.id.slice(0, 8)} ────────────────────────────────┐\x1b[0m\n`);
+
+  if (note.title) {
+    console.log(`  \x1b[1m${note.title}\x1b[0m\n`);
+  }
+
+  console.log(`  ${note.raw}\n`);
+
+  if (note.tags.length > 0) {
+    console.log(`  Tags: \x1b[33m${note.tags.join(", ")}\x1b[0m`);
+  }
+
+  if (Object.keys(note.fields).length > 0) {
+    console.log(`\n  \x1b[1mFields:\x1b[0m`);
+    for (const [key, field] of Object.entries(note.fields)) {
+      const value = Array.isArray(field.value) ? field.value.join(", ") : field.value;
+      console.log(`    ${key}: ${value}`);
+    }
+  }
+
+  if (note.relatedTasks && note.relatedTasks.length > 0) {
+    console.log(`\n  \x1b[1mLinked Tasks:\x1b[0m`);
+    for (const taskId of note.relatedTasks) {
+      const task = await storage.loadTask(taskId);
+      if (task) {
+        console.log(`    → ${taskId.slice(0, 6)}: ${task.raw.substring(0, 40)}`);
+      }
+    }
+  }
+
+  console.log(`\n  \x1b[90mCreated: ${new Date(note.created).toLocaleString()}\x1b[0m`);
+}
+
+async function deleteNote(id: string) {
+  const deleted = await storage.deleteNote(id);
+
+  if (deleted) {
+    console.log(`\n\x1b[32m✓ Note deleted: ${id}\x1b[0m`);
+  } else {
+    console.log(`\n\x1b[31m✗ Note not found: ${id}\x1b[0m`);
+  }
+}
+
+async function showNotesForTask(taskId: string) {
+  let task = await storage.loadTask(taskId);
+  if (!task) {
+    task = await storage.findTaskByPrefix(taskId);
+  }
+
+  if (!task) {
+    console.log(`\n\x1b[31m✗ Task not found: ${taskId}\x1b[0m`);
+    return;
+  }
+
+  const result = await storage.queryNotes({ relatedToTask: task.id });
+
+  if (result.notes.length === 0) {
+    console.log(`\n\x1b[33mNo notes linked to task: ${task.id.slice(0, 6)}\x1b[0m`);
+    return;
+  }
+
+  console.log(`\n\x1b[36m┌─ Notes for Task: ${task.id.slice(0, 6)} ────────────────────┐\x1b[0m\n`);
+
+  for (const note of result.notes) {
+    displayNote(note);
+  }
+}
+
+// ============================================================================
 // EXPORT
 // ============================================================================
 
@@ -1747,6 +1992,18 @@ function showHelp() {
 \x1b[33mExport:\x1b[0m
   tx --export json|markdown|ical    Export tasks
 
+\x1b[33mNotes:\x1b[0m
+  tx --note <content>               Create a note with semantic tagging
+  tx --note <content> --link-task <id>  Create note linked to a task
+  tx --notes                        List all notes
+  tx --note-search <query>          Search notes
+  tx --note-tag <tag>               Notes with a specific tag
+  tx --note-view <id>               View a note in detail
+  tx --note-delete <id>             Delete a note
+  tx --note-tags                    Show all discovered tags
+  tx --note-entities                Show discovered entities
+  tx --notes-for <task-id>          Notes linked to a task
+
 \x1b[33mServer:\x1b[0m
   tx --serve                        Start tRPC server (default port: 3847)
   tx --serve --port <port>          Start on custom port
@@ -1800,6 +2057,10 @@ function parseArgs(args: string[]): ParsedArgs {
     "--scopes": "scopes",
     "--current-scope": "current-scope",
     "--unset-scope": "unset-scope",
+    // Note commands
+    "--notes": "notes-list",
+    "--note-tags": "note-tags",
+    "--note-entities": "note-entities",
   };
 
   if (simpleCommands[args[0]]) {
@@ -1944,6 +2205,54 @@ function parseArgs(args: string[]): ParsedArgs {
     result.command = "merge";
     result.params.canonical = args[1] || "";
     result.params.variant = args[2] || "";
+    return result;
+  }
+
+  // Note creation
+  if (args[0] === "--note") {
+    result.command = "note-add";
+    // Parse optional --link-task
+    const linkIdx = args.indexOf("--link-task");
+    if (linkIdx !== -1 && args[linkIdx + 1]) {
+      result.params.linkTask = args[linkIdx + 1];
+      args = [...args.slice(0, linkIdx), ...args.slice(linkIdx + 2)];
+    }
+    result.params.raw = args.slice(1).join(" ");
+    return result;
+  }
+
+  // Note search
+  if (args[0] === "--note-search") {
+    result.command = "note-search";
+    result.params.query = args.slice(1).join(" ");
+    return result;
+  }
+
+  // Note by tag
+  if (args[0] === "--note-tag" && args[1]) {
+    result.command = "note-by-tag";
+    result.params.tag = args[1];
+    return result;
+  }
+
+  // View a note
+  if (args[0] === "--note-view" && args[1]) {
+    result.command = "note-view";
+    result.params.id = args[1];
+    return result;
+  }
+
+  // Delete a note
+  if (args[0] === "--note-delete" && args[1]) {
+    result.command = "note-delete";
+    result.params.id = args[1];
+    return result;
+  }
+
+  // Notes for a task
+  if (args[0] === "--notes-for" && args[1]) {
+    result.command = "notes-for-task";
+    result.params.taskId = args[1];
     return result;
   }
 
@@ -2267,6 +2576,43 @@ async function main() {
         const port = params.port ? parseInt(params.port, 10) : undefined;
         await startServerCLI(port);
         return; // Server runs until interrupted
+
+      // ---- Note Commands ----
+      case "note-add":
+        await addNote(params.raw, params.linkTask);
+        break;
+
+      case "notes-list":
+        await listNotes();
+        break;
+
+      case "note-search":
+        await searchNotes(params.query);
+        break;
+
+      case "note-by-tag":
+        await listNotesByTag(params.tag);
+        break;
+
+      case "note-tags":
+        await showNoteTags();
+        break;
+
+      case "note-entities":
+        await showNoteEntities();
+        break;
+
+      case "note-view":
+        await viewNote(params.id);
+        break;
+
+      case "note-delete":
+        await deleteNote(params.id);
+        break;
+
+      case "notes-for-task":
+        await showNotesForTask(params.taskId);
+        break;
 
       default:
         showHelp();

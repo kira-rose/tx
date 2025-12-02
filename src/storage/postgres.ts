@@ -15,6 +15,9 @@ import {
   PostgresStorageConfig,
   DEFAULT_SCHEMA,
   DEFAULT_INDEX,
+  Note,
+  NoteIndex,
+  DEFAULT_NOTE_INDEX,
 } from "../types/index.js";
 
 // Type definitions for pg module
@@ -103,6 +106,29 @@ export class PostgresStorage extends BaseStorage {
       CREATE INDEX IF NOT EXISTS idx_task_fields_name ON task_fields(field_name);
       CREATE INDEX IF NOT EXISTS idx_task_fields_value ON task_fields(field_value);
       CREATE INDEX IF NOT EXISTS idx_task_fields_normalized ON task_fields(normalized_value);
+
+      -- Notes table
+      CREATE TABLE IF NOT EXISTS notes (
+        id TEXT PRIMARY KEY,
+        raw TEXT NOT NULL,
+        title TEXT,
+        created TIMESTAMP NOT NULL,
+        updated TIMESTAMP NOT NULL,
+        fields JSONB NOT NULL,
+        tags JSONB NOT NULL,
+        related_tasks JSONB,
+        related_notes JSONB,
+        source TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created);
+      CREATE INDEX IF NOT EXISTS idx_notes_tags ON notes USING GIN(tags);
+
+      -- Note index
+      CREATE TABLE IF NOT EXISTS note_index (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        data JSONB NOT NULL
+      );
     `);
 
     // Initialize index if not exists
@@ -120,6 +146,15 @@ export class PostgresStorage extends BaseStorage {
       await this.pool.query(
         "INSERT INTO schema (id, data) VALUES (1, $1)",
         [JSON.stringify({ ...DEFAULT_SCHEMA, lastUpdated: new Date().toISOString() })]
+      );
+    }
+
+    // Initialize note index if not exists
+    const noteIndexResult = await this.pool.query("SELECT 1 FROM note_index WHERE id = 1");
+    if (noteIndexResult.rows.length === 0) {
+      await this.pool.query(
+        "INSERT INTO note_index (id, data) VALUES (1, $1)",
+        [JSON.stringify(DEFAULT_NOTE_INDEX)]
       );
     }
   }
@@ -539,6 +574,121 @@ export class PostgresStorage extends BaseStorage {
       end: end.toISOString().split("T")[0],
     };
   }
+
+  // ---- Note Operations ----
+
+  async saveNote(note: Note): Promise<void> {
+    if (!this.pool) throw new Error("Database not initialized");
+
+    await this.pool.query(
+      `INSERT INTO notes (
+        id, raw, title, created, updated, fields, tags,
+        related_tasks, related_notes, source
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      ON CONFLICT (id) DO UPDATE SET
+        raw = EXCLUDED.raw,
+        title = EXCLUDED.title,
+        updated = EXCLUDED.updated,
+        fields = EXCLUDED.fields,
+        tags = EXCLUDED.tags,
+        related_tasks = EXCLUDED.related_tasks,
+        related_notes = EXCLUDED.related_notes,
+        source = EXCLUDED.source`,
+      [
+        note.id,
+        note.raw,
+        note.title || null,
+        note.created,
+        note.updated,
+        JSON.stringify(note.fields),
+        JSON.stringify(note.tags),
+        note.relatedTasks ? JSON.stringify(note.relatedTasks) : null,
+        note.relatedNotes ? JSON.stringify(note.relatedNotes) : null,
+        note.source || null,
+      ]
+    );
+  }
+
+  async loadNote(id: string): Promise<Note | null> {
+    if (!this.pool) throw new Error("Database not initialized");
+
+    const result = await this.pool.query<NoteRow>(
+      "SELECT * FROM notes WHERE id = $1",
+      [id]
+    );
+
+    if (result.rows.length === 0) return null;
+    return this.noteFromRow(result.rows[0]);
+  }
+
+  async deleteNote(id: string): Promise<boolean> {
+    if (!this.pool) throw new Error("Database not initialized");
+
+    const result = await this.pool.query("DELETE FROM notes WHERE id = $1", [id]);
+    if (result.rowCount > 0) {
+      const index = await this.loadNoteIndex();
+      index.notes = index.notes.filter((nid) => nid !== id);
+      await this.saveNoteIndex(index);
+      return true;
+    }
+    return false;
+  }
+
+  async loadAllNotes(): Promise<Note[]> {
+    if (!this.pool) throw new Error("Database not initialized");
+
+    const result = await this.pool.query<NoteRow>(
+      "SELECT * FROM notes ORDER BY created DESC"
+    );
+
+    return result.rows.map((row) => this.noteFromRow(row));
+  }
+
+  async loadNoteIndex(): Promise<NoteIndex> {
+    if (!this.pool) throw new Error("Database not initialized");
+
+    const result = await this.pool.query<{ data: NoteIndex }>(
+      "SELECT data FROM note_index WHERE id = 1"
+    );
+
+    if (result.rows.length === 0) return { ...DEFAULT_NOTE_INDEX };
+    return result.rows[0].data;
+  }
+
+  async saveNoteIndex(index: NoteIndex): Promise<void> {
+    if (!this.pool) throw new Error("Database not initialized");
+
+    await this.pool.query(
+      "UPDATE note_index SET data = $1 WHERE id = 1",
+      [JSON.stringify(index)]
+    );
+  }
+
+  async getAllNoteIds(): Promise<string[]> {
+    if (!this.pool) throw new Error("Database not initialized");
+
+    const result = await this.pool.query<{ id: string }>("SELECT id FROM notes");
+    return result.rows.map((row) => row.id);
+  }
+
+  private noteFromRow(row: NoteRow): Note {
+    return {
+      id: row.id,
+      raw: row.raw,
+      title: row.title || undefined,
+      created: row.created,
+      updated: row.updated,
+      fields: typeof row.fields === "string" ? JSON.parse(row.fields) : row.fields,
+      tags: typeof row.tags === "string" ? JSON.parse(row.tags) : row.tags,
+      relatedTasks: row.related_tasks
+        ? (typeof row.related_tasks === "string" ? JSON.parse(row.related_tasks) : row.related_tasks)
+        : undefined,
+      relatedNotes: row.related_notes
+        ? (typeof row.related_notes === "string" ? JSON.parse(row.related_notes) : row.related_notes)
+        : undefined,
+      source: row.source || undefined,
+    };
+  }
 }
 
 // Type for database rows
@@ -557,5 +707,18 @@ interface TaskRow {
   recurrence: Task["recurrence"] | null;
   template_id: string | null;
   archived: boolean;
+}
+
+interface NoteRow {
+  id: string;
+  raw: string;
+  title: string | null;
+  created: string;
+  updated: string;
+  fields: Record<string, Note["fields"][string]> | string;
+  tags: string[] | string;
+  related_tasks: string[] | string | null;
+  related_notes: string[] | string | null;
+  source: string | null;
 }
 

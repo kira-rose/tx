@@ -24,9 +24,10 @@ import {
   Scope,
   SemanticField,
   FieldDefinition,
+  Note,
 } from "../types/index.js";
 
-import { extractSemantics, addFieldToSchema } from "../extraction/index.js";
+import { extractSemantics, addFieldToSchema, extractNoteSemantics, updateNoteIndex, removeNoteFromIndex } from "../extraction/index.js";
 
 // ============================================================================
 // TASK ROUTER
@@ -1021,12 +1022,326 @@ export const scopeRouter = router({
     }),
 });
 
+// ============================================================================
+// NOTE ROUTER
+// ============================================================================
+
+export const noteRouter = router({
+  /**
+   * List all notes with optional filtering
+   */
+  list: publicProcedure
+    .input(z.object({
+      tags: z.array(z.string()).optional(),
+      search: z.string().optional(),
+      relatedToTask: z.string().optional(),
+      limit: z.number().optional(),
+      offset: z.number().optional(),
+    }).optional())
+    .query(async ({ ctx, input }) => {
+      const result = await ctx.storage.queryNotes(input || {});
+      return result;
+    }),
+
+  /**
+   * Get a single note by ID or prefix
+   */
+  get: publicProcedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ ctx, input }) => {
+      let note = await ctx.storage.loadNote(input.id);
+      
+      if (!note) {
+        note = await ctx.storage.findNoteByPrefix(input.id);
+      }
+      
+      if (!note) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: `Note not found: ${input.id}`,
+        });
+      }
+      
+      return note;
+    }),
+
+  /**
+   * Create a new note with semantic extraction
+   */
+  create: publicProcedure
+    .input(z.object({
+      raw: z.string(),
+      source: z.string().optional(),
+      relatedTasks: z.array(z.string()).optional(),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const noteId = randomUUID();
+      const now = new Date().toISOString();
+
+      // Load indexes for context
+      const noteIndex = await ctx.storage.loadNoteIndex();
+      const taskIndex = await ctx.storage.loadIndex();
+
+      // Extract semantic information
+      const extractionResult = await extractNoteSemantics(
+        input.raw,
+        ctx.config.llm,
+        noteIndex,
+        taskIndex
+      );
+
+      // Create the note
+      const note: Note = {
+        id: noteId,
+        raw: input.raw,
+        title: extractionResult.title,
+        created: now,
+        updated: now,
+        fields: extractionResult.fields,
+        tags: extractionResult.tags,
+        relatedTasks: input.relatedTasks || extractionResult.relatedTaskIds,
+        relatedNotes: [],
+        source: input.source,
+      };
+
+      // Save the note
+      await ctx.storage.saveNote(note);
+
+      // Update the note index
+      updateNoteIndex(noteIndex, noteId, extractionResult);
+      await ctx.storage.saveNoteIndex(noteIndex);
+
+      return {
+        note,
+        discoveredEntities: extractionResult.entities,
+      };
+    }),
+
+  /**
+   * Update an existing note
+   */
+  update: publicProcedure
+    .input(z.object({
+      id: z.string(),
+      raw: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      relatedTasks: z.array(z.string()).optional(),
+      relatedNotes: z.array(z.string()).optional(),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const note = await ctx.storage.loadNote(input.id);
+      
+      if (!note) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: `Note not found: ${input.id}`,
+        });
+      }
+
+      let extractionResult = null;
+
+      // Update fields
+      if (input.raw !== undefined && input.raw !== note.raw) {
+        // Store old tags for index update
+        const oldTags = [...note.tags];
+        
+        // Load indexes
+        const noteIndex = await ctx.storage.loadNoteIndex();
+        const taskIndex = await ctx.storage.loadIndex();
+        
+        // Find old entities that referenced this note
+        const oldEntities = Object.entries(noteIndex.entities)
+          .filter(([_, info]) => info.relatedNoteIds.includes(note.id))
+          .map(([name, _]) => name);
+        
+        // Remove old contributions from index
+        removeNoteFromIndex(noteIndex, note.id, oldTags, oldEntities);
+        
+        // Re-extract semantics with new content
+        extractionResult = await extractNoteSemantics(
+          input.raw,
+          ctx.config.llm,
+          noteIndex,
+          taskIndex
+        );
+        
+        // Update note with new extraction results
+        note.raw = input.raw;
+        note.title = extractionResult.title;
+        note.fields = extractionResult.fields;
+        note.tags = extractionResult.tags;
+        
+        // Add new contributions to index
+        updateNoteIndex(noteIndex, note.id, extractionResult);
+        await ctx.storage.saveNoteIndex(noteIndex);
+      }
+
+      if (input.tags !== undefined) {
+        note.tags = input.tags;
+      }
+      if (input.relatedTasks !== undefined) {
+        note.relatedTasks = input.relatedTasks;
+      }
+      if (input.relatedNotes !== undefined) {
+        note.relatedNotes = input.relatedNotes;
+      }
+
+      note.updated = new Date().toISOString();
+      await ctx.storage.saveNote(note);
+
+      return {
+        note,
+        discoveredEntities: extractionResult?.entities || [],
+      };
+    }),
+
+  /**
+   * Delete a note
+   */
+  delete: publicProcedure
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      // Load the note first to get its tags for index cleanup
+      const note = await ctx.storage.loadNote(input.id);
+      
+      if (!note) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: `Note not found: ${input.id}`,
+        });
+      }
+
+      // Load and update the index
+      const noteIndex = await ctx.storage.loadNoteIndex();
+      
+      // Find entities that referenced this note
+      const noteEntities = Object.entries(noteIndex.entities)
+        .filter(([_, info]) => info.relatedNoteIds.includes(input.id))
+        .map(([name, _]) => name);
+      
+      // Remove note's contributions from index
+      removeNoteFromIndex(noteIndex, input.id, note.tags, noteEntities);
+      
+      // Remove note ID from index
+      noteIndex.notes = noteIndex.notes.filter(id => id !== input.id);
+      
+      await ctx.storage.saveNoteIndex(noteIndex);
+      
+      // Now delete the note
+      await ctx.storage.deleteNote(input.id);
+
+      return { success: true, id: input.id };
+    }),
+
+  /**
+   * Get note index (tags, entities, stats)
+   */
+  index: publicProcedure.query(async ({ ctx }) => {
+    return ctx.storage.loadNoteIndex();
+  }),
+
+  /**
+   * Get all unique tags - calculated dynamically from actual notes
+   */
+  tags: publicProcedure.query(async ({ ctx }) => {
+    const notes = await ctx.storage.loadAllNotes();
+    const tagCounts: Record<string, number> = {};
+    
+    for (const note of notes) {
+      for (const tag of note.tags) {
+        tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+      }
+    }
+    
+    return Object.entries(tagCounts)
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count);
+  }),
+
+  /**
+   * Get all discovered entities - calculated dynamically from index
+   * Only return entities that have actual notes still referencing them
+   */
+  entities: publicProcedure.query(async ({ ctx }) => {
+    const index = await ctx.storage.loadNoteIndex();
+    const notes = await ctx.storage.loadAllNotes();
+    const noteIds = new Set(notes.map(n => n.id));
+    
+    // Filter entities to only those with valid note references
+    return Object.values(index.entities)
+      .map(entity => ({
+        ...entity,
+        // Filter to only existing note IDs
+        relatedNoteIds: entity.relatedNoteIds.filter(id => noteIds.has(id)),
+      }))
+      .filter(e => e.relatedNoteIds.length > 0)
+      .map(e => ({
+        ...e,
+        occurrences: e.relatedNoteIds.length, // Recalculate based on actual references
+      }))
+      .sort((a, b) => b.occurrences - a.occurrences);
+  }),
+
+  /**
+   * Find notes related to a task
+   */
+  forTask: publicProcedure
+    .input(z.object({ taskId: z.string() }))
+    .query(async ({ ctx, input }) => {
+      const result = await ctx.storage.queryNotes({
+        relatedToTask: input.taskId,
+      });
+      return result.notes;
+    }),
+
+  /**
+   * Link a note to a task
+   */
+  linkToTask: publicProcedure
+    .input(z.object({
+      noteId: z.string(),
+      taskId: z.string(),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const note = await ctx.storage.loadNote(input.noteId);
+      
+      if (!note) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: `Note not found: ${input.noteId}`,
+        });
+      }
+
+      // Verify task exists
+      const task = await ctx.storage.loadTask(input.taskId);
+      if (!task) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: `Task not found: ${input.taskId}`,
+        });
+      }
+
+      // Add task to note's related tasks
+      if (!note.relatedTasks) {
+        note.relatedTasks = [];
+      }
+      if (!note.relatedTasks.includes(input.taskId)) {
+        note.relatedTasks.push(input.taskId);
+        note.updated = new Date().toISOString();
+        await ctx.storage.saveNote(note);
+      }
+
+      return note;
+    }),
+});
+
 export const appRouter = router({
   task: taskRouter,
   schema: schemaRouter,
   index: indexRouter,
   scope: scopeRouter,
   system: systemRouter,
+  note: noteRouter,
 });
 
 export type AppRouter = typeof appRouter;

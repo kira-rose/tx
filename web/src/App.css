@@ -248,6 +248,10 @@
   flex: 1;
 }
 
+.notes-section {
+  flex: 1;
+}
+
 /* Footer */
 .footer {
   display: flex;
@@ -315,7 +319,7 @@
     gap: 0;
   }
 
-  .nav-btn span:not(.nav-icon) {
+  .nav-label {
     display: none;
   }
 

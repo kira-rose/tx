@@ -15,6 +15,8 @@ import {
   SemanticField,
   FieldDefinition,
   LLMConfig,
+  NoteIndex,
+  EntityInfo,
 } from "../types/index.js";
 
 // ============================================================================
@@ -383,5 +385,235 @@ export function addFieldToSchema(
 
   schema.version++;
   return true;
+}
+
+// ============================================================================
+// NOTE EXTRACTION
+// ============================================================================
+
+interface NoteExtractionResult {
+  title?: string;
+  tags: string[];
+  fields: Record<string, SemanticField>;
+  entities: EntityInfo[];
+  relatedTaskIds: string[];
+}
+
+function getNoteExtractionPrompt(
+  noteContent: string,
+  existingTags: string[],
+  existingEntities: Record<string, EntityInfo>,
+  taskIndex: TaskIndex
+): string {
+  const existingTagsList = existingTags.length > 0
+    ? `\nExisting tags in the system: ${existingTags.join(", ")}`
+    : "";
+
+  const entityNames = Object.keys(existingEntities);
+  const existingEntitiesList = entityNames.length > 0
+    ? `\nKnown entities: ${entityNames.slice(0, 50).join(", ")}`
+    : "";
+
+  // Get project/subject names from task index for relationship matching
+  const knownProjects = taskIndex.structures["subject"]?.examples || [];
+
+  return `Analyze this note and extract semantic information.
+
+Today's date: ${getToday()}
+${existingTagsList}
+${existingEntitiesList}
+${knownProjects.length > 0 ? `Known projects/subjects: ${knownProjects.join(", ")}` : ""}
+
+NOTE CONTENT:
+"""
+${noteContent}
+"""
+
+Extract the following:
+1. A brief title (if one isn't obvious, create a concise summary)
+2. Tags - relevant categories, topics, or labels. Prefer using existing tags when appropriate.
+3. Entities - people, projects, concepts, locations, or organizations mentioned
+4. Semantic fields - key information structured as fields
+5. Related projects/subjects - any mentioned that might link to existing tasks
+
+Respond in this exact JSON format:
+{
+  "title": "Brief title or summary",
+  "tags": ["tag1", "tag2"],
+  "fields": {
+    "topic": { "name": "topic", "value": "main topic" },
+    "people": { "name": "people", "value": ["person1", "person2"] },
+    "context": { "name": "context", "value": "relevant context" }
+  },
+  "entities": [
+    { "name": "EntityName", "type": "person|project|concept|location|organization|other" }
+  ],
+  "relatedProjects": ["project1", "project2"]
+}
+
+Notes:
+- Tags should be lowercase, use underscores for multi-word tags
+- Entity types must be one of: person, project, concept, location, organization, other
+- Fields can include: topic, people, context, source, date_mentioned, key_points, action_items
+- Only include fields that are clearly present in the note`;
+}
+
+export async function extractNoteSemantics(
+  noteContent: string,
+  llmConfig: LLMConfig,
+  noteIndex: NoteIndex,
+  taskIndex: TaskIndex
+): Promise<NoteExtractionResult> {
+  const model = createModel(llmConfig);
+
+  // Gather existing tags and entities
+  const existingTags = Object.keys(noteIndex.tagStats);
+  const existingEntities = noteIndex.entities;
+
+  const prompt = getNoteExtractionPrompt(
+    noteContent,
+    existingTags,
+    existingEntities,
+    taskIndex
+  );
+
+  try {
+    const response = await model.invoke([
+      new SystemMessage(
+        "You are a semantic analyzer for a note-taking system. " +
+        "Extract structured information from notes to enable powerful tagging, " +
+        "searching, and relationship discovery. Be concise and accurate."
+      ),
+      new HumanMessage(prompt),
+    ]);
+
+    const content = typeof response.content === "string"
+      ? response.content
+      : JSON.stringify(response.content);
+
+    // Extract JSON from response
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return createFallbackNoteResult(noteContent);
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+
+    // Process entities
+    const entities: EntityInfo[] = (parsed.entities || []).map((e: { name: string; type: string }) => ({
+      name: e.name,
+      type: e.type as EntityInfo["type"],
+      occurrences: 1,
+      relatedTaskIds: [],
+      relatedNoteIds: [],
+    }));
+
+    // Related task IDs based on project/subject matches
+    // For now return empty - actual linking happens at a higher level
+    const relatedTaskIds: string[] = [];
+
+    return {
+      title: parsed.title,
+      tags: (parsed.tags || []).map((t: string) => t.toLowerCase().replace(/\s+/g, "_")),
+      fields: parsed.fields || {},
+      entities,
+      relatedTaskIds,
+    };
+  } catch (error) {
+    console.error("Note extraction failed:", error);
+    return createFallbackNoteResult(noteContent);
+  }
+}
+
+function createFallbackNoteResult(noteContent: string): NoteExtractionResult {
+  // Create a basic title from the first line or first 50 chars
+  const firstLine = noteContent.split("\n")[0].trim();
+  const title = firstLine.length > 50 
+    ? firstLine.substring(0, 47) + "..." 
+    : firstLine;
+
+  // Extract basic tags from hashtags if present
+  const hashtagMatches = noteContent.match(/#(\w+)/g) || [];
+  const tags = hashtagMatches.map(t => t.substring(1).toLowerCase());
+
+  return {
+    title,
+    tags,
+    fields: {},
+    entities: [],
+    relatedTaskIds: [],
+  };
+}
+
+// Update note index with new tags and entities
+export function updateNoteIndex(
+  index: NoteIndex,
+  noteId: string,
+  extractionResult: NoteExtractionResult
+): void {
+  // Add note ID to index
+  if (!index.notes.includes(noteId)) {
+    index.notes.push(noteId);
+    index.stats.totalCreated++;
+  }
+
+  // Update tag stats
+  for (const tag of extractionResult.tags) {
+    index.tagStats[tag] = (index.tagStats[tag] || 0) + 1;
+    index.stats.byTag[tag] = (index.stats.byTag[tag] || 0) + 1;
+  }
+
+  // Update entities
+  for (const entity of extractionResult.entities) {
+    if (index.entities[entity.name]) {
+      index.entities[entity.name].occurrences++;
+      if (!index.entities[entity.name].relatedNoteIds.includes(noteId)) {
+        index.entities[entity.name].relatedNoteIds.push(noteId);
+      }
+    } else {
+      index.entities[entity.name] = {
+        ...entity,
+        relatedNoteIds: [noteId],
+      };
+    }
+  }
+}
+
+// Remove a note's contributions from the index (for updates/deletes)
+export function removeNoteFromIndex(
+  index: NoteIndex,
+  noteId: string,
+  oldTags: string[],
+  oldEntities: string[] // Entity names that were in the old note
+): void {
+  // Decrement tag stats
+  for (const tag of oldTags) {
+    if (index.tagStats[tag]) {
+      index.tagStats[tag]--;
+      if (index.tagStats[tag] <= 0) {
+        delete index.tagStats[tag];
+      }
+    }
+    if (index.stats.byTag[tag]) {
+      index.stats.byTag[tag]--;
+      if (index.stats.byTag[tag] <= 0) {
+        delete index.stats.byTag[tag];
+      }
+    }
+  }
+
+  // Update entity references
+  for (const entityName of oldEntities) {
+    if (index.entities[entityName]) {
+      index.entities[entityName].occurrences--;
+      index.entities[entityName].relatedNoteIds = 
+        index.entities[entityName].relatedNoteIds.filter(id => id !== noteId);
+      
+      // Remove entity if no more references
+      if (index.entities[entityName].occurrences <= 0) {
+        delete index.entities[entityName];
+      }
+    }
+  }
 }
 
